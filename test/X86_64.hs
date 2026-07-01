@@ -2,7 +2,9 @@
              ForeignFunctionInterface, GADTs #-}
 module Main (main) where
 
+import Control.Exception (try, IOException)
 import Control.Monad (replicateM_)
+import System.IO.Error (isDoesNotExistError)
 import qualified Data.ByteString as BS
 import Data.Word
 import Data.Int
@@ -22,6 +24,7 @@ import Harpy.X86_64.Macro
 import Harpy.X86_64.Call
   ( invoke
   , invokeI64
+  , invokeEither
   , unsafeInvoke
   , unsafeInvokeI64
   , unsafeInvokeI64_I64
@@ -65,6 +68,11 @@ emitBytes code = do
       Left err -> return (Left (show err))
       Right ((), img) -> return (Right (BS.unpack (codeImageBytes img)))
 
+-- Sentinel returned when the nasm binary is not installed, so differential
+-- tests skip rather than fail on machines (e.g. CI) without nasm.
+nasmMissing :: String
+nasmMissing = "\0nasm-not-installed"
+
 -- Assemble with nasm in 64-bit mode
 nasmAssemble64 :: String -> IO (Either String [Word8])
 nasmAssemble64 asmText =
@@ -72,10 +80,13 @@ nasmAssemble64 asmText =
       let srcFile = dir ++ "/harpy_x64_test.asm"
           outFile = dir ++ "/harpy_x64_test.bin"
       writeFile srcFile $ "BITS 64\n" ++ asmText ++ "\n"
-      (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
-      case ec of
-        ExitFailure _ -> return $ Left $ "nasm: " ++ err
-        ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
+      r <- try (readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] "")
+      case r of
+        Left e
+          | isDoesNotExistError e -> return (Left nasmMissing)
+          | otherwise             -> return (Left ("nasm: " ++ show (e :: IOException)))
+        Right (ExitFailure _, _, err) -> return $ Left $ "nasm: " ++ err
+        Right (ExitSuccess, _, _)     -> Right . BS.unpack <$> BS.readFile outFile
 
 -- Golden test: emit code, compare against expected bytes
 testGolden :: String -> CodeGen () () () -> [Word8] -> IO Result
@@ -96,6 +107,22 @@ testRejects code = do
       Left _  -> pass
       Right b -> failWith $ "expected rejection, got " ++ showHex b
 
+-- invokeEither: happy path returns Right result
+testInvokeEitherOk :: IO Result
+testInvokeEitherOk = do
+    r <- invokeEither (mov (op rax) (imm 42) >> ret)
+    case r of
+      Right 42 -> pass
+      other    -> failWith $ "expected Right 42, got " ++ show other
+
+-- invokeEither: a rejected program returns Left, it does not crash
+testInvokeEitherErr :: IO Result
+testInvokeEitherErr = do
+    r <- invokeEither (mov (op eax) (imm 0x100000000) >> ret)
+    case r of
+      Left _  -> pass
+      Right v -> failWith $ "expected Left, got Right " ++ show v
+
 -- Differential test: compare harpy output against nasm 64-bit
 testDiff :: String -> CodeGen () () () -> IO Result
 testDiff nasmCode harpyCode = do
@@ -103,7 +130,8 @@ testDiff nasmCode harpyCode = do
     nr <- nasmAssemble64 nasmCode
     case (hr, nr) of
       (Left err, _) -> failWith $ "harpy: " ++ err
-      (_, Left err) -> failWith $ "nasm: " ++ err
+      (_, Left err) | err == nasmMissing -> pure (Skip "nasm not installed")
+                    | otherwise          -> failWith $ "nasm: " ++ err
       (Right hb, Right nb)
         | hb == nb  -> pass
         | otherwise -> failWith $
@@ -509,4 +537,8 @@ main = runTests
     , ("g-movabs-rax",        testGolden "mov rax, 0x100000000"
         (mov (op rax) (imm 0x100000000))
         [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+
+    -- invokeEither surfaces assembly failure as Left instead of crashing
+    , ("invoke-either-ok",   testInvokeEitherOk)
+    , ("invoke-either-err",  testInvokeEitherErr)
     ]

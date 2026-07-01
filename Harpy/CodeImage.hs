@@ -56,8 +56,9 @@ import System.Posix.Process (getProcessID)
 
 -- | An executable code region backed by mmap'd memory.
 data Executable = Executable
-  { execPtr  :: {-# UNPACK #-} !(Ptr Word8)
-  , execSize :: {-# UNPACK #-} !Int
+  { execPtr      :: {-# UNPACK #-} !(Ptr Word8)
+  , execSize     :: {-# UNPACK #-} !Int  -- ^ page-aligned mapping size (for @munmap@)
+  , execCodeSize :: {-# UNPACK #-} !Int  -- ^ emitted code length (for perf maps)
   }
 
 -- | Return the entry point pointer of an executable.
@@ -78,7 +79,7 @@ loadCodeImage img = do
     (do BS.useAsCStringLen bytes $ \(src, srcLen) ->
           copyBytes (ExecMem.mappingPtr mapping) (castPtr src) srcLen
         ExecMem.protect ExecMem.ReadExecute mapping
-        return (Executable (ExecMem.mappingPtr mapping) (ExecMem.mappingSize mapping)))
+        return (Executable (ExecMem.mappingPtr mapping) (ExecMem.mappingSize mapping) len))
       `onException` ExecMem.free mapping
 
 -- | Compile code directly into executable memory.
@@ -91,14 +92,14 @@ compileExecutable code uenv ustate = do
     (ustate', res) <- compileExecutableBuffer code uenv ustate
     case res of
       Left err -> return (ustate', Left err)
-      Right (val, ptr, size) -> return (ustate', Right (val, Executable ptr size))
+      Right (val, ptr, size, codeSize) -> return (ustate', Right (val, Executable ptr size codeSize))
 
 -- | Compile code directly into executable memory, run an action, and free
 -- the executable mapping afterwards.
 withCompiledExecutable :: CodeGen e s a -> e -> s -> (a -> Executable -> IO b) -> IO (s, Either ErrMsg b)
 withCompiledExecutable code uenv ustate action =
-    withCompiledExecutableBuffer code uenv ustate $ \val ptr size ->
-      action val (Executable ptr size)
+    withCompiledExecutableBuffer code uenv ustate $ \val ptr size codeSize ->
+      action val (Executable ptr size codeSize)
 
 -- | Load a 'CodeImage', run an action with the executable, then free it.
 withExecutable :: CodeImage -> (Executable -> IO a) -> IO a
@@ -106,7 +107,7 @@ withExecutable img = bracket (loadCodeImage img) freeExecutable
 
 -- | Free the executable memory.
 freeExecutable :: Executable -> IO ()
-freeExecutable (Executable p sz) = ExecMem.free (ExecMem.Mapping p sz)
+freeExecutable exe = ExecMem.free (ExecMem.Mapping (execPtr exe) (execSize exe))
 
 ------------------------------------------------------------------------
 -- Inspection helpers
@@ -139,7 +140,7 @@ writePerfMapEntry name exe = do
     CPid pid <- getProcessID
     let path = "/tmp/perf-" ++ show pid ++ ".map"
         ptr  = execPtr exe
-        sz   = execSize exe
+        sz   = execCodeSize exe   -- emitted code length, not the mapping size
         addr = ptrToWordPtr (castPtr ptr)
         line = showHex (fromIntegral addr :: Word) ""
             ++ " " ++ showHex sz ""

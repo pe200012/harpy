@@ -354,7 +354,10 @@ assembleCodeImageWithConfig code uenv ustate conf =
 -- release it with the same mapping size via @munmap@; higher-level users
 -- should prefer 'Harpy.CodeImage.compileExecutable' or
 -- 'Harpy.CodeImage.withCompiledExecutable'.
-compileExecutableBuffer :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg (a, Ptr Word8, Int))
+-- | Returns @(result, entry pointer, mapping size, code size)@.  The mapping
+-- size is page-aligned (use it to @munmap@); the code size is the number of
+-- emitted bytes (use it for symbol tables / perf maps).
+compileExecutableBuffer :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg (a, Ptr Word8, Int, Int))
 compileExecutableBuffer code uenv ustate =
     do let initSize = ExecMem.pageAlign (max (codeBufferSize defaultCodeGenConfig) 64)
        buf <- mmapRW initSize
@@ -380,20 +383,20 @@ compileExecutableBuffer code uenv ustate =
                return (ustate', Left (text msg))
              else do
                mprotectRX finalBuf finalSize `onException` mmapFree finalBuf finalSize
-               return (ustate', Right (val, finalBuf, finalSize))
+               return (ustate', Right (val, finalBuf, finalSize, bufferOfs finalState))
 
 -- | Compile generated code into executable memory, run an action, and
 -- always release the mapping afterwards.
-withCompiledExecutableBuffer :: CodeGen e s a -> e -> s -> (a -> Ptr Word8 -> Int -> IO b) -> IO (s, Either ErrMsg b)
+withCompiledExecutableBuffer :: CodeGen e s a -> e -> s -> (a -> Ptr Word8 -> Int -> Int -> IO b) -> IO (s, Either ErrMsg b)
 withCompiledExecutableBuffer code uenv ustate action = do
     (ustate', res) <- compileExecutableBuffer code uenv ustate
     case res of
       Left err -> return (ustate', Left err)
-      Right (val, ptr, size) -> do
+      Right (val, ptr, size, codeSize) -> do
         out <- bracket
-          (return (val, ptr, size))
-          (\(_, p, sz) -> mmapFree p sz)
-          (\(v, p, sz) -> action v p sz)
+          (return ())
+          (\() -> mmapFree ptr size)
+          (\() -> action val ptr size codeSize)
         return (ustate', Right out)
 
 -- | Check whether the code buffer has room for at least the given
