@@ -32,6 +32,8 @@ module Harpy.CodeImage(
     , codeImageBytes
     , codeImageSize
     , lookupSymbol
+    -- * Debugging
+    , writePerfMapEntry
     ) where
 
 import Harpy.CodeGenMonad
@@ -44,6 +46,10 @@ import Data.Bits
 import Data.Word
 import Foreign
 import Foreign.C.Types
+import Numeric (showHex)
+import System.IO (hPutStr, hFlush, IOMode(..), withFile)
+import System.Posix.Types (CPid(..))
+import System.Posix.Process (getProcessID)
 
 -- | An executable code region backed by mmap'd memory.
 data Executable = Executable
@@ -127,3 +133,24 @@ lookupSymbol name img =
     case [ciSymbolOffset s | s <- codeImageSymbols img, ciSymbolName s == name] of
       (o:_) -> Just o
       []    -> Nothing
+
+------------------------------------------------------------------------
+-- Debugging: Linux perf map
+------------------------------------------------------------------------
+
+-- | Append an entry to @\/tmp\/perf-\<pid\>.map@ for the given executable.
+-- This allows @perf record@ and @perf report@ to show JIT symbol names.
+-- Format per line: @\<hex-addr\> \<hex-size\> \<name\>@
+writePerfMapEntry :: String -> Executable -> IO ()
+writePerfMapEntry name exe = do
+    CPid pid <- getProcessID
+    let path = "/tmp/perf-" ++ show pid ++ ".map"
+        ptr  = execPtr exe
+        sz   = execSize exe
+        addr = ptrToWordPtr (castPtr ptr)
+        line = showHex (fromIntegral addr :: Word) ""
+            ++ " " ++ showHex sz ""
+            ++ " " ++ name ++ "\n"
+    withFile path AppendMode $ \h -> do
+      hPutStr h line
+      hFlush h
