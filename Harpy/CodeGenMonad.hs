@@ -37,6 +37,11 @@ module Harpy.CodeGenMonad(
           CodeGenConfig(..),
           firstBuffer,
           defaultCodeGenConfig,
+    -- * CodeImage types
+          CodeImage(..),
+          Section(..),
+          SectionKind(..),
+          CISymbol(..),
     -- * Functions
     -- ** General code generator monad operations
           failCodeGen,
@@ -70,6 +75,9 @@ module Harpy.CodeGenMonad(
     -- ** Executing code generation
           runCodeGen,
           runCodeGenWithConfig,
+    -- ** Producing a CodeImage
+          assembleCodeImage,
+          assembleCodeImageWithConfig,
     -- ** Calling generated functions
           callDecl,
     -- ** Interface to disassembler
@@ -86,6 +94,8 @@ import Text.PrettyPrint.HughesPJ
 
 import Numeric
 
+import Data.Bits
+import qualified Data.ByteString as BS
 import Data.List
 import qualified Data.Map as Map
 import Foreign
@@ -120,8 +130,7 @@ data CodeGenConfig = CodeGenConfig {
 -- | Internal state of the code generator
 data CodeGenState = CodeGenState {
       buffer        :: Ptr Word8,                    -- ^ Pointer to current code buffer.
-      bufferList    :: [(Ptr Word8, Int)],           -- ^ List of all other code buffers.
-      firstBuffer   :: Ptr Word8,                    -- ^ Pointer to first buffer.
+      firstBuffer   :: Ptr Word8,                    -- ^ Pointer to first buffer (same as buffer, kept for API compat).
       bufferOfs     :: Int,                          -- ^ Current offset into buffer where next instruction will be stored.
       bufferSize    :: Int,                          -- ^ Size of current buffer.
       relocEntries  :: [Reloc],                      -- ^ List of all emitted relocation entries.
@@ -167,6 +176,30 @@ data Reloc = Reloc { offset :: Int,
 -- | Label
 data Label = Label Int String
            deriving (Eq, Ord)
+
+-- | What kind of data a section holds.
+data SectionKind = TextSection | ReadOnlyDataSection | WritableDataSection
+  deriving (Show, Eq)
+
+-- | A section of assembled output.
+data Section = Section
+  { sectionKind  :: SectionKind
+  , sectionBytes :: BS.ByteString
+  } deriving (Show, Eq)
+
+-- | A named symbol at an offset within the text section.
+data CISymbol = CISymbol
+  { ciSymbolName   :: String
+  , ciSymbolOffset :: Int
+  } deriving (Show, Eq)
+
+-- | Architecture-independent assembled code.  Can be inspected,
+-- serialized, or loaded into executable memory via
+-- 'Harpy.CodeImage.loadCodeImage'.
+data CodeImage = CodeImage
+  { codeImageSections :: [Section]
+  , codeImageSymbols  :: [CISymbol]
+  } deriving (Show, Eq)
 
 unCg :: CodeGen e s a -> ((e, CodeGenEnv) -> (s, CodeGenState) -> IO ((s, CodeGenState), Either ErrMsg a))
 unCg (CodeGen a) = a
@@ -214,7 +247,6 @@ instance MonadIO (CodeGen e s) where
 
 emptyCodeGenState :: CodeGenState
 emptyCodeGenState = CodeGenState { buffer = undefined,
-                                   bufferList = [],
                                    firstBuffer = undefined,
                                    bufferOfs = 0,
                                    bufferSize = 0,
@@ -245,11 +277,57 @@ runCodeGen :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg a)
 runCodeGen cg uenv ustate =
     runCodeGenWithConfig cg uenv ustate defaultCodeGenConfig
 
-foreign import ccall "static stdlib.h"
-  memalign :: CUInt -> CUInt -> IO (Ptr a)
+foreign import ccall "sys/mman.h mmap"
+  c_mmap :: Ptr () -> CSize -> CInt -> CInt -> CInt -> CLong -> IO (Ptr Word8)
 
-foreign import ccall "static sys/mman.h"
-  mprotect :: CUInt -> CUInt -> Int -> IO Int
+foreign import ccall "sys/mman.h mprotect"
+  c_mprotect :: Ptr Word8 -> CSize -> CInt -> IO CInt
+
+foreign import ccall "sys/mman.h munmap"
+  c_munmap :: Ptr Word8 -> CSize -> IO CInt
+
+foreign import ccall "string.h memcpy"
+  c_memcpy :: Ptr Word8 -> Ptr Word8 -> CSize -> IO (Ptr Word8)
+
+protRead, protWrite, protExec :: CInt
+protRead  = 0x1
+protWrite = 0x2
+protExec  = 0x4
+
+mapPrivate, mapAnonymous :: CInt
+mapPrivate   = 0x2
+mapAnonymous = 0x20
+
+mapFailed :: Ptr Word8
+mapFailed = intPtrToPtr (-1)
+
+pageAlign :: Int -> Int
+pageAlign n = (n + 4095) .&. complement 4095
+
+mmapRW :: Int -> IO (Ptr Word8)
+mmapRW size = do
+    let sz = fromIntegral (pageAlign size)
+    p <- c_mmap nullPtr sz (protRead .|. protWrite) (mapPrivate .|. mapAnonymous) (-1) 0
+    if p == mapFailed
+      then ioError (userError "Harpy: mmap failed")
+      else return p
+
+mmapFree :: Ptr Word8 -> Int -> IO ()
+mmapFree p size = do _ <- c_munmap p (fromIntegral (pageAlign size)); return ()
+
+mprotectRX :: Ptr Word8 -> Int -> IO ()
+mprotectRX p size = do
+    rc <- c_mprotect p (fromIntegral (pageAlign size)) (protRead .|. protExec)
+    if rc /= 0
+      then ioError (userError "Harpy: mprotect RX failed")
+      else return ()
+
+mprotectRW :: Ptr Word8 -> Int -> IO ()
+mprotectRW p size = do
+    rc <- c_mprotect p (fromIntegral (pageAlign size)) (protRead .|. protWrite)
+    if rc /= 0
+      then ioError (userError "Harpy: mprotect RW failed")
+      else return ()
 
 -- | Like 'runCodeGen', but allows more control over the code
 -- generation process.  In addition to a code generator and a user
@@ -258,22 +336,55 @@ foreign import ccall "static sys/mman.h"
 -- allocation of code buffers, for example.
 runCodeGenWithConfig :: CodeGen e s a -> e -> s -> CodeGenConfig -> IO (s, Either ErrMsg a)
 runCodeGenWithConfig (CodeGen cg) uenv ustate conf =
-    do (buf, sze) <- case customCodeBuffer conf of
-                       Nothing -> do let initSize = codeBufferSize conf
-                                     let size = fromIntegral initSize
-                                     arr <- memalign 0x1000 size
-                                     -- 0x7 = PROT_{READ,WRITE,EXEC}
-                                     _ <- mprotect (fromIntegral $ ptrToIntPtr arr) size 0x7
-                                     return (arr, initSize)
-                       Just (buf, sze) -> return (buf, sze)
+    do (buf, sze, managed) <- case customCodeBuffer conf of
+                       Nothing -> do let initSize = pageAlign (codeBufferSize conf)
+                                     arr <- mmapRW initSize
+                                     return (arr, initSize, True)
+                       Just (buf, sze) -> return (buf, sze, False)
        let env = CodeGenEnv {tailContext = True}
        let state = emptyCodeGenState{buffer = buf,
-                                     bufferList = [],
                                      firstBuffer = buf,
                                      bufferSize = sze,
                                      config = conf}
-       ((ustate', _), res) <- cg (uenv, env) (ustate, state)
+       ((ustate', finalState), res) <- cg (uenv, env) (ustate, state)
+       -- Finalize: flip buffer to RX so generated code is executable
+       when managed $
+         mprotectRX (firstBuffer finalState) (bufferSize finalState)
        return (ustate', res)
+
+-- | Run code generation and capture the result as a 'CodeImage'.
+-- The code is emitted into a temporary buffer (not mapped executable).
+-- Use 'Harpy.CodeImage.loadCodeImage' to load the result into
+-- executable memory.
+assembleCodeImage :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg (a, CodeImage))
+assembleCodeImage cg uenv ustate =
+    assembleCodeImageWithConfig cg uenv ustate defaultCodeGenConfig
+
+-- | Like 'assembleCodeImage', but with explicit configuration.
+assembleCodeImageWithConfig :: CodeGen e s a -> e -> s -> CodeGenConfig -> IO (s, Either ErrMsg (a, CodeImage))
+assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
+    do let initSize = max (codeBufferSize conf) 64
+       buf <- mallocBytes initSize
+       let env = CodeGenEnv {tailContext = True}
+       let state = emptyCodeGenState{buffer = buf,
+                                     firstBuffer = buf,
+                                     bufferOfs = 0,
+                                     bufferSize = initSize,
+                                     config = conf{customCodeBuffer = Nothing}}
+       ((ustate', finalState), res) <- cg (uenv, env) (ustate, state)
+       case res of
+         Left err -> do free buf; return (ustate', Left err)
+         Right val -> do
+           let len = bufferOfs finalState
+           bytes <- BS.packCStringLen (castPtr (buffer finalState), len)
+           let syms = [ CISymbol name ofs
+                       | (_, (_, ofs, name)) <- Map.toList (definedLabels finalState)
+                       , not (null name) ]
+               img = CodeImage
+                       { codeImageSections = [Section TextSection bytes]
+                       , codeImageSymbols  = syms }
+           free (buffer finalState)
+           return (ustate', Right (val, img))
 
 -- | Check whether the code buffer has room for at least the given
 -- number of bytes.  This should be called by code generators
@@ -294,32 +405,41 @@ checkBufferSize needed =
                             int (bufferSize state) <> text ")"))
 
 -- | Make sure that the code buffer has room for at least the given
--- number of bytes.  This should be called by code generators whenever
--- it cannot be guaranteed that the code buffer is large enough to
--- hold all the generated code.  Creates a new buffer and places a
--- jump to the new buffer when there is not sufficient space
--- available.  When code generation was invoked with a pre-defined
--- code buffer, code generation is aborted on overflow.
---
--- /Note:/ Starting with version 0.4, Harpy automatically checks for
--- buffer overflow, so you do not need to call this function anymore.
+-- number of bytes.  When the buffer is managed by Harpy, grows it
+-- in place (mmap a larger region, copy, unmap old).  When a custom
+-- buffer was provided, fails on overflow.
 ensureBufferSize :: Int -> CodeGen e s ()
 ensureBufferSize needed =
     do state <- getInternalState
-       case (customCodeBuffer (config state)) of
+       case customCodeBuffer (config state) of
          Nothing ->
-             unless (bufferOfs state + needed + 5 <= bufferSize state)
-                        (do let incrSize = max (needed + 16) (codeBufferSize (config state))
-                            arr <- liftIO $ mallocBytes incrSize
-                            ofs <- getCodeOffset
-                            let buf = buffer state
-                                disp :: Int
-                                disp = arr `minusPtr` (buf `plusPtr` ofs) - 5
-                            emit8 0xe9    -- FIXME: Machine dependent!
-                            emit32 (fromIntegral disp)
+             unless (bufferOfs state + needed <= bufferSize state)
+                        (do let oldSize = bufferSize state
+                                newSize = pageAlign (max (oldSize * 2) (bufferOfs state + needed))
+                                oldBuf  = buffer state
+                            newBuf <- liftIO $ do
+                              nb <- mmapRW newSize
+                              _ <- c_memcpy nb oldBuf (fromIntegral (bufferOfs state))
+                              mmapFree oldBuf oldSize
+                              return nb
                             st <- getInternalState
-                            setInternalState st{buffer = arr, bufferList = bufferList st ++ [(buffer st, bufferOfs st)], bufferOfs = 0})
-         Just (_, _) -> checkBufferSize needed
+                            setInternalState st{ buffer = newBuf
+                                               , firstBuffer = newBuf
+                                               , bufferSize = newSize
+                                               , definedLabels = Map.map (rebaseLabel oldBuf newBuf) (definedLabels st)
+                                               , pendingFixups = Map.map (map (rebaseFixup oldBuf newBuf)) (pendingFixups st)
+                                               })
+         Just _ -> checkBufferSize needed
+
+rebaseLabel :: Ptr Word8 -> Ptr Word8 -> (Ptr Word8, Int, String) -> (Ptr Word8, Int, String)
+rebaseLabel oldBuf newBuf (buf, ofs, name)
+  | buf == oldBuf = (newBuf, ofs, name)
+  | otherwise     = (buf, ofs, name)
+
+rebaseFixup :: Ptr Word8 -> Ptr Word8 -> FixupEntry -> FixupEntry
+rebaseFixup oldBuf newBuf fue@(FixupEntry{fueBuffer = buf})
+  | buf == oldBuf = fue{fueBuffer = newBuf}
+  | otherwise     = fue
 
 -- | Return a pointer to the beginning of the first code buffer, which
 -- is normally the entry point to the generated code.
@@ -382,7 +502,7 @@ getBasePtr =
 -- (i.e., actually used space for code, not allocated size).
 getCodeBufferList :: CodeGen e s [(Ptr Word8, Int)]
 getCodeBufferList = do st <- getInternalState
-                       return $ bufferList st ++ [(buffer st, bufferOfs st)]
+                       return [(buffer st, bufferOfs st)]
 
 -- | Generate a new label to be used with the label operations
 -- 'emitFixup' and 'defineLabel'.
@@ -532,15 +652,10 @@ labelAddress (Label lab name) = do
 disassemble :: CodeGen e s [Dis.Instruction]
 disassemble = do
   s <- getInternalState
-  let buffers = bufferList s
-  r <- mapM (\ (buff, len) -> do
-             r <- liftIO $ Dis.disassembleBlock buff len
-             case r of
-                    Left err -> cgFail $ show err
-                    Right instr -> return instr
-            ) $ buffers ++ [(buffer s, bufferOfs s)]
-  r' <- insertLabels (concat r)
-  return r'
+  r <- liftIO $ Dis.disassembleBlock (buffer s) (bufferOfs s)
+  case r of
+    Left err -> cgFail $ show err
+    Right instrs -> insertLabels instrs
  where insertLabels :: [Dis.Instruction] -> CodeGen e s [Dis.Instruction]
        insertLabels = liftM concat . mapM ins
        ins :: Dis.Instruction -> CodeGen e s [Dis.Instruction]
@@ -585,6 +700,11 @@ callDecl ns qt =  do
     vs <- mkArgs t
     cbody <- [| CodeGen (\env (ustate, state) ->
                         do let code = firstBuffer state
+                               sz   = bufferSize state
+                               managed = case customCodeBuffer (config state) of
+                                           Nothing -> True
+                                           Just _  -> False
+                           when managed $ mprotectRX code sz
                            res <- liftIO $ $(do
                                              c <- newName "c"
                                              cast <- [|castPtrToFunPtr|]
@@ -593,6 +713,7 @@ callDecl ns qt =  do
                                                                 (VarE c))
                                              return $ LamE [VarP c] $ foldl AppE f $ map VarE vs
                                             ) code
+                           when managed $ mprotectRW code sz
                            return $ ((ustate, state), Right res))|]
     let call = ValD (VarP name) (NormalB $ LamE (map VarP vs) cbody) []
     return [ dyn, call ]
