@@ -88,6 +88,14 @@ testGolden _desc code expected = do
         | otherwise -> failWith $
             "expected " ++ showHex expected ++ " got " ++ showHex actual
 
+-- Negative test: assembling the code must fail (recoverably, not crash)
+testRejects :: CodeGen () () () -> IO Result
+testRejects code = do
+    r <- emitBytes code
+    case r of
+      Left _  -> pass
+      Right b -> failWith $ "expected rejection, got " ++ showHex b
+
 -- Differential test: compare harpy output against nasm 64-bit
 testDiff :: String -> CodeGen () () () -> IO Result
 testDiff nasmCode harpyCode = do
@@ -480,11 +488,25 @@ main = runTests
     , ("x-lea",         testExec "lea rax, [rcx+rdx]"
         (do mov (op rcx) (imm 20)
             mov (op rdx) (imm 22)
-            lea rax (Mem (Just rcx) (Just (rdx, S1)) 0)
+            lea rax (baseIndex rcx rdx S1 0)
             ret) 42)
     , ("x-simd-dot-i32x4", testExecSIMDDotI32x4)
     , ("x-retN",        testExec "retN 0 returns normally"
         (mov (op rax) (imm 42) >> retN 0) 42)
     , ("d-inc-eax",     testDiff "inc eax" (inc (op eax)))
     , ("d-neg-rcx",     testDiff "neg rcx" (neg (op rcx)))
+
+    -- Rejection tests: illegal operands must fail recoverably, not crash or
+    -- silently truncate (see the operand-validation review).
+    , ("r-imm-oversize-w32",  testRejects (mov (op eax) (imm 0x100000000)))
+    , ("r-imm-oversize-w64",  testRejects (add (op rax) (imm 0x100000000)))
+    , ("r-imm-dest",          testRejects (add (imm 5) (op rax)))
+    , ("r-mem-mem",           testRejects (add (mem (base rax)) (mem (base rbx) :: Operand 'W64)))
+    , ("r-shift-nonCL",       testRejects (shl (op rax) (op (rdx :: Reg 'W64))))
+    , ("r-shift-count-huge",  testRejects (shl (op rax) (imm 300)))
+    , ("r-rsp-index",         testRejects (lea rax (index rsp S4 0)))
+    -- mov r64, imm64 (movabs) is still allowed: a full 64-bit immediate is fine
+    , ("g-movabs-rax",        testGolden "mov rax, 0x100000000"
+        (mov (op rax) (imm 0x100000000))
+        [0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
     ]

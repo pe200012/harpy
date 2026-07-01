@@ -13,7 +13,10 @@
 module Harpy.X86_64 (
     -- * Width and register types
       Width(..), SWidth(..), IsWidth(..)
-    , Reg(..), XMM(..)
+    -- | 'Reg', 'XMM', 'Mem' and 'Operand' are exported abstractly: build
+    -- them only through the named registers and the smart constructors below,
+    -- so no ill-formed register code or operand can be constructed.
+    , Reg, XMM
     -- * Named registers (64-bit)
     , rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi
     , r8, r9, r10, r11, r12, r13, r14, r15
@@ -28,9 +31,9 @@ module Harpy.X86_64 (
     , xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7
     , xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15
     -- * Memory operands
-    , Mem(..), addr, base, index, disp
+    , Mem, addr, base, index, baseIndex, disp
     -- * Operand type
-    , Operand(..), op, mem, imm
+    , Operand, op, mem, imm
     -- * Scale
     , Scale(..)
     -- * ISA database types
@@ -74,7 +77,9 @@ import Harpy.CodeGenMonad
     , newLabel, newNamedLabel, setLabel, defineLabel, (@@)
     , emitFixup, FixupKind(..)
     , tryLabelOffset
+    , failCodeGen
     )
+import Text.PrettyPrint (text)
 import qualified Harpy.X86_64.Encoding as Enc
 
 ------------------------------------------------------------------------
@@ -181,6 +186,11 @@ base r = Mem (Just r) Nothing 0
 
 index :: Reg 'W64 -> Scale -> Int32 -> Mem w
 index r s d = Mem Nothing (Just (r, s)) d
+
+-- | @baseIndex b i s d@ builds the operand @[b + i*s + d]@.  @i@ must not be
+-- 'rsp' (it encodes \"no index\" in a SIB byte); this is rejected at emit time.
+baseIndex :: Reg 'W64 -> Reg 'W64 -> Scale -> Int32 -> Mem w
+baseIndex b i s d = Mem (Just b) (Just (i, s)) d
 
 disp :: Reg 'W64 -> Int32 -> Mem w
 disp r d = Mem (Just r) Nothing d
@@ -342,7 +352,7 @@ emitModRMrr reg rm = emit8 (modRM 3 (regCode reg) (regCode rm))
 
 -- Emit ModRM + optional SIB + displacement for a memory operand
 emitModRMmem :: Word8 -> Mem w -> CodeGen e s ()
-emitModRMmem regBits m = case (memBase m, memIndex m, memDisp m) of
+emitModRMmem regBits m = checkIndex >> case (memBase m, memIndex m, memDisp m) of
   -- [disp32] (no base, no index) — use SIB form: mod=00, rm=100(SIB), base=101(none), index=100(none)
   (Nothing, Nothing, d) -> do
     emit8 (modRM 0 regBits 4)
@@ -381,6 +391,12 @@ emitModRMmem regBits m = case (memBase m, memIndex m, memDisp m) of
     emit8 (modRM (scaleVal sc) (regCode ir) bc)
     emitDisp md d
   where
+    -- SIB index 0b100 means "no index", so RSP can never be a SIB index.
+    checkIndex :: CodeGen e s ()
+    checkIndex = case memIndex m of
+      Just (ir, _) | regCode ir == 4 && Prelude.not (regExt ir) ->
+        failCodeGen (text "RSP cannot be used as a SIB index register")
+      _ -> return ()
     modBits :: Int32 -> Bool -> Word8
     modBits d forceDisp
       | d == 0 && Prelude.not forceDisp = 0
@@ -441,6 +457,26 @@ isImm8' n = n >= -128 && n <= 127
 isImm32' :: Int64 -> Bool
 isImm32' n = n >= fromIntegral (minBound :: Int32) && n <= fromIntegral (maxBound :: Int32)
 
+-- | Reject an immediate that does not fit the operand width before it is
+-- silently truncated by the encoder.  A 64-bit operand takes a
+-- sign-extended @imm32@ (the sole exception, @mov r64,imm64@, does its own
+-- emission and never calls this), so its accepted range is @imm32@.
+checkImm :: SWidth w -> Int64 -> CodeGen e s ()
+checkImm w i = case w of
+  SW8  | i >= -128        && i <= 255        -> return ()
+  SW16 | i >= -32768      && i <= 65535      -> return ()
+  SW32 | i >= -2147483648 && i <= 4294967295 -> return ()
+  SW64 | isImm32' i                          -> return ()
+  _ -> failCodeGen $ text $
+         "immediate " ++ Prelude.show i ++ " out of range for " ++
+         Prelude.show w ++ " operand"
+
+-- | Range-check the immediate carried by a source operand (a no-op for
+-- register/memory sources).
+checkSrcImm :: SWidth w -> Operand w -> CodeGen e s ()
+checkSrcImm w (ImmOp i) = checkImm w i
+checkSrcImm _ _         = return ()
+
 ------------------------------------------------------------------------
 -- Declarative instruction database
 ------------------------------------------------------------------------
@@ -480,7 +516,7 @@ data InsnDesc = InsnDesc
 
 -- ALU: two-operand, same-width, all addressing modes
 emitFormALU :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
-emitFormALU grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+emitFormALU grp dst src = ensureBufferSize maxInsnBytes >> checkSrcImm (swidth @w) src >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
     emit8 (aluRmRegOpcode (swidth @w) grp)
@@ -513,7 +549,7 @@ emitFormALU grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
         emit8 (aluImmOpcode (swidth @w) i)
         emitModRMmem grp m
         emitAluImmediate (swidth @w) i
-  _ -> error "invalid ALU operand combination"
+  _ -> failCodeGen (text "invalid ALU operand combination (an immediate cannot be a destination, and two memory operands are not allowed)")
 
 -- Unary: single r/m operand, opcode + /digit
 emitFormUnary :: forall w e s. IsWidth w => Word8 -> Word8 -> Operand w -> CodeGen e s ()
@@ -526,7 +562,7 @@ emitFormUnary opc digit o = ensureBufferSize maxInsnBytes >> case o of
     emitRexRM @w (Reg @w 0) m
     emit8 (unaryOpcode (swidth @w) opc)
     emitModRMmem digit m
-  _ -> error "invalid unary operand"
+  _ -> failCodeGen (text "invalid unary operand (an immediate has no r/m form)")
 
 -- Shift: dst, src (imm or CL)
 emitFormShift :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
@@ -536,6 +572,7 @@ emitFormShift digit dst src = ensureBufferSize maxInsnBytes >> case (dst, src) o
     emit8 (if isW8 (swidth @w) then 0xD0 else 0xD1)
     emit8 (modRM 3 digit (regCode rd))
   (RegOp rd, ImmOp i) -> do
+    checkImm SW8 i   -- shift count is an imm8
     emitRexR @w rd
     emit8 (if isW8 (swidth @w) then 0xC0 else 0xC1)
     emit8 (modRM 3 digit (regCode rd))
@@ -544,7 +581,7 @@ emitFormShift digit dst src = ensureBufferSize maxInsnBytes >> case (dst, src) o
     emitRexR @w rd
     emit8 (if isW8 (swidth @w) then 0xD2 else 0xD3)
     emit8 (modRM 3 digit (regCode rd))
-  _ -> error "invalid shift operand combination"
+  _ -> failCodeGen (text "invalid shift operand combination (variable shifts must use CL as the count)")
 
 -- Two-byte reg,r/m: 0F xx /r
 emitFormTwoByteReg :: forall w e s. IsWidth w => Word8 -> Reg w -> Operand w -> CodeGen e s ()
@@ -559,7 +596,7 @@ emitFormTwoByteReg opc2 rd src = ensureBufferSize maxInsnBytes >> case src of
     emit8 0x0F
     emit8 opc2
     emitModRMmem (regCode rd) m
-  _ -> error "invalid two-byte reg operand"
+  _ -> failCodeGen (text "invalid two-byte reg operand (an immediate source is not supported)")
 
 -- Opcode+rd: PUSH/POP style, 64-bit only, no REX.W
 emitFormOpRd :: Word8 -> Reg 'W64 -> CodeGen e s ()
@@ -624,7 +661,7 @@ cmp = emitFormALU 7
 
 -- TEST has a unique encoding (not in the ALU family)
 test :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+test dst src = ensureBufferSize maxInsnBytes >> checkSrcImm (swidth @w) src >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
     emit8 (if isW8 (swidth @w) then 0x84 else 0x85)
@@ -643,7 +680,7 @@ test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
     emitRexRM @w rs m
     emit8 (if isW8 (swidth @w) then 0x84 else 0x85)
     emitModRMmem (regCode rs) m
-  _ -> error "invalid TEST operand combination"
+  _ -> failCodeGen (text "invalid TEST operand combination")
 
 -- MOV has multiple encoding forms (not table-driven yet)
 mov :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
@@ -664,16 +701,20 @@ mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
           emit8 (0xB8 + regCode rd)
           emit32 (fromIntegral i)
           emit32 (fromIntegral (i `shiftR` 32))
+    -- SW64 above accepts a full imm64 (movabs); narrower widths must fit.
     SW32 -> do
+      checkImm SW32 i
       emitRexOp @w rd
       emit8 (0xB8 + regCode rd)
       emit32 (fromIntegral i)
     SW16 -> do
+      checkImm SW16 i
       emitRexOp @w rd
       emit8 (0xB8 + regCode rd)
       emit8 (fromIntegral i)
       emit8 (fromIntegral (i `shiftR` 8))
     SW8 -> do
+      checkImm SW8 i
       emitRexOp @w rd
       emit8 (0xB0 + regCode rd)
       emit8 (fromIntegral i)
@@ -686,11 +727,12 @@ mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
     emit8 (if isW8 (swidth @w) then 0x88 else 0x89)
     emitModRMmem (regCode rs) m
   (MemOp m, ImmOp i) -> do
+    checkImm (swidth @w) i
     emitRexRM @w (Reg @w 0) m
     emit8 (if isW8 (swidth @w) then 0xC6 else 0xC7)
     emitModRMmem 0 m
     emitImmWidth (swidth @w) i
-  _ -> error "invalid MOV operand combination"
+  _ -> failCodeGen (text "invalid MOV operand combination")
 
 lea :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()
 lea rd m = do

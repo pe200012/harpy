@@ -184,7 +184,7 @@ ex9_memory = do
   result <- invoke $ do
     -- Compute 5 * 8 + 2 = 42 using LEA with scale
     mov (op rcx) (imm 5)
-    lea rax (Mem (Just rcx) Nothing 0)     -- lea rax, [rcx] (just base)
+    lea rax (base rcx)                     -- lea rax, [rcx] (just base)
     -- rax = 5, now multiply by 8 using shift
     shl (op rax) (imm 3)                   -- rax = 40
     add (op rax) (imm 2)                   -- rax = 42
