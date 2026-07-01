@@ -30,6 +30,13 @@ module Harpy.X86_64 (
     , Operand(..), op, mem, imm
     -- * Scale
     , Scale(..)
+    -- * ISA database types
+    , InsnForm(..), InsnDesc(..)
+    -- * ISA table entries
+    , iADD, iOR, iADC, iSBB, iAND, iSUB, iXOR, iCMP
+    , iINC, iDEC, iNEG, iNOT, iIDIV, iMUL
+    , iSHL, iSHR, iSAR, iROL, iROR
+    , iIMUL, iPUSH, iPOP
     -- * Instructions
     , mov, add, sub, xor, and, or, cmp, test
     , lea
@@ -311,53 +318,72 @@ isImm32' :: Int64 -> Bool
 isImm32' n = n >= fromIntegral (minBound :: Int32) && n <= fromIntegral (maxBound :: Int32)
 
 ------------------------------------------------------------------------
--- ALU instructions (add, sub, xor, and, or, cmp)
+-- Declarative instruction database
 ------------------------------------------------------------------------
 
--- ALU group index: ADD=0 OR=1 ADC=2 SBB=3 AND=4 SUB=5 XOR=6 CMP=7
-type AluOp = Word8
+-- | Encoding form for an instruction. Each constructor captures a family
+-- of instructions that share the same encoding pattern, parameterized
+-- by opcode bytes or digit extensions.
+data InsnForm
+  = FormALU Word8
+    -- ^ ALU group 0-7 (add/or/adc/sbb/and/sub/xor/cmp).
+    -- Handles reg/reg, reg/imm, reg/mem, mem/reg, mem/imm variants
+    -- with automatic imm8 sign-extension and EAX/RAX shortcuts.
+  | FormUnary Word8 Word8
+    -- ^ @opcode /digit@ for single-operand r/m instructions.
+    -- First byte is the opcode (0xFF, 0xF7, etc.), second is the
+    -- ModRM.reg extension digit.
+  | FormShift Word8
+    -- ^ Shift/rotate group. The digit selects the operation:
+    -- SHL=4 SHR=5 SAR=7 ROL=0 ROR=1 RCL=2 RCR=3.
+    -- Handles reg/1, reg/imm8, and reg/CL forms.
+  | FormTwoByteReg Word8
+    -- ^ Two-byte opcode @0F xx /r@ for reg,r/m instructions (IMUL, MOVZX, etc.).
+  | FormOpRd Word8
+    -- ^ Opcode+rd encoding for single-register instructions (PUSH, POP).
+    -- Only used for 64-bit registers (no REX.W, just REX.B if extended).
+  deriving (Show, Eq)
 
-emitAlu :: forall w e s. IsWidth w => AluOp -> Operand w -> Operand w -> CodeGen e s ()
-emitAlu grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
-  -- reg, reg
+-- | Instruction descriptor — one row per instruction in the ISA table.
+data InsnDesc = InsnDesc
+  { insnName :: String
+  , insnForm :: InsnForm
+  } deriving (Show, Eq)
+
+------------------------------------------------------------------------
+-- Generic emitters driven by InsnForm
+------------------------------------------------------------------------
+
+-- ALU: two-operand, same-width, all addressing modes
+emitFormALU :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
+emitFormALU grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
-    emit8 (grp `shiftL` 3 .|. 1)  -- ALU r/m, reg
+    emit8 (grp `shiftL` 3 .|. 1)
     emitModRMrr rs rd
-
-  -- reg, imm
   (RegOp rd, ImmOp i)
-    -- EAX/RAX shortcut
     | regCode rd == 0 && Prelude.not (regExt rd) && Prelude.not (isImm8' i) -> do
         emitRexR @w rd
         emit8 (grp `shiftL` 3 .|. 5)
         emit32 (fromIntegral i)
-    -- imm8 sign-extended
     | isImm8' i -> do
         emitRexR @w rd
         emit8 0x83
         emit8 (modRM 3 grp (regCode rd))
         emit8 (fromIntegral i)
-    -- imm32
     | otherwise -> do
         emitRexR @w rd
         emit8 0x81
         emit8 (modRM 3 grp (regCode rd))
         emit32 (fromIntegral i)
-
-  -- reg, [mem]
   (RegOp rd, MemOp m) -> do
     emitRexRM @w rd m
-    emit8 (grp `shiftL` 3 .|. 3) -- ALU reg, r/m
+    emit8 (grp `shiftL` 3 .|. 3)
     emitModRMmem (regCode rd) m
-
-  -- [mem], reg
   (MemOp m, RegOp rs) -> do
     emitRexRM @w rs m
-    emit8 (grp `shiftL` 3 .|. 1) -- ALU r/m, reg
+    emit8 (grp `shiftL` 3 .|. 1)
     emitModRMmem (regCode rs) m
-
-  -- [mem], imm
   (MemOp m, ImmOp i)
     | isImm8' i -> do
         emitRexRM @w (Reg @w 0) m
@@ -369,31 +395,116 @@ emitAlu grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
         emit8 0x81
         emitModRMmem grp m
         emit32 (fromIntegral i)
-
   _ -> error "invalid ALU operand combination"
 
-add :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-add = emitAlu 0
+-- Unary: single r/m operand, opcode + /digit
+emitFormUnary :: forall w e s. IsWidth w => Word8 -> Word8 -> Operand w -> CodeGen e s ()
+emitFormUnary opc digit o = ensureBufferSize maxInsnBytes >> case o of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 opc
+    emit8 (modRM 3 digit (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 opc
+    emitModRMmem digit m
+  _ -> error "invalid unary operand"
 
-or :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-or = emitAlu 1
+-- Shift: dst, src (imm or CL)
+emitFormShift :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
+emitFormShift digit dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+  (RegOp rd, ImmOp 1) -> do
+    emitRexR @w rd
+    emit8 0xD1
+    emit8 (modRM 3 digit (regCode rd))
+  (RegOp rd, ImmOp i) -> do
+    emitRexR @w rd
+    emit8 0xC1
+    emit8 (modRM 3 digit (regCode rd))
+    emit8 (fromIntegral i)
+  (RegOp rd, RegOp (Reg 1)) -> do
+    emitRexR @w rd
+    emit8 0xD3
+    emit8 (modRM 3 digit (regCode rd))
+  _ -> error "invalid shift operand combination"
 
-and :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-and = emitAlu 4
+-- Two-byte reg,r/m: 0F xx /r
+emitFormTwoByteReg :: forall w e s. IsWidth w => Word8 -> Reg w -> Operand w -> CodeGen e s ()
+emitFormTwoByteReg opc2 rd src = ensureBufferSize maxInsnBytes >> case src of
+  RegOp rs -> do
+    emitRexRR @w rd rs
+    emit8 0x0F
+    emit8 opc2
+    emitModRMrr rd rs
+  MemOp m -> do
+    emitRexRM @w rd m
+    emit8 0x0F
+    emit8 opc2
+    emitModRMmem (regCode rd) m
+  _ -> error "invalid two-byte reg operand"
 
-sub :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-sub = emitAlu 5
-
-xor :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-xor = emitAlu 6
-
-cmp :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-cmp = emitAlu 7
+-- Opcode+rd: PUSH/POP style, 64-bit only, no REX.W
+emitFormOpRd :: Word8 -> Reg 'W64 -> CodeGen e s ()
+emitFormOpRd opcBase r = do
+  ensureBufferSize maxInsnBytes
+  if regExt r then emitRex rexB else return ()
+  emit8 (opcBase + regCode r)
 
 ------------------------------------------------------------------------
--- TEST
+-- Instruction table (declarative ISA database)
 ------------------------------------------------------------------------
 
+-- ALU family
+iADD, iOR, iADC, iSBB, iAND, iSUB, iXOR, iCMP :: InsnDesc
+iADD = InsnDesc "add" (FormALU 0)
+iOR  = InsnDesc "or"  (FormALU 1)
+iADC = InsnDesc "adc" (FormALU 2)
+iSBB = InsnDesc "sbb" (FormALU 3)
+iAND = InsnDesc "and" (FormALU 4)
+iSUB = InsnDesc "sub" (FormALU 5)
+iXOR = InsnDesc "xor" (FormALU 6)
+iCMP = InsnDesc "cmp" (FormALU 7)
+
+-- Unary r/m family
+iINC, iDEC, iNEG, iNOT, iIDIV, iMUL :: InsnDesc
+iINC  = InsnDesc "inc"  (FormUnary 0xFF 0)
+iDEC  = InsnDesc "dec"  (FormUnary 0xFF 1)
+iNEG  = InsnDesc "neg"  (FormUnary 0xF7 3)
+iNOT  = InsnDesc "not"  (FormUnary 0xF7 2)
+iIDIV = InsnDesc "idiv" (FormUnary 0xF7 7)
+iMUL  = InsnDesc "mul"  (FormUnary 0xF7 4)
+
+-- Shift family
+iSHL, iSHR, iSAR, iROL, iROR :: InsnDesc
+iSHL = InsnDesc "shl" (FormShift 4)
+iSHR = InsnDesc "shr" (FormShift 5)
+iSAR = InsnDesc "sar" (FormShift 7)
+iROL = InsnDesc "rol" (FormShift 0)
+iROR = InsnDesc "ror" (FormShift 1)
+
+-- Two-byte reg,r/m
+iIMUL :: InsnDesc
+iIMUL = InsnDesc "imul" (FormTwoByteReg 0xAF)
+
+-- Opcode+rd
+iPUSH, iPOP :: InsnDesc
+iPUSH = InsnDesc "push" (FormOpRd 0x50)
+iPOP  = InsnDesc "pop"  (FormOpRd 0x58)
+
+------------------------------------------------------------------------
+-- Public instruction API (thin wrappers over the table)
+------------------------------------------------------------------------
+
+-- ALU
+add, sub, xor, and, or, cmp :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+add = emitFormALU 0
+or  = emitFormALU 1
+and = emitFormALU 4
+sub = emitFormALU 5
+xor = emitFormALU 6
+cmp = emitFormALU 7
+
+-- TEST has a unique encoding (not in the ALU family)
 test :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
 test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
@@ -416,19 +527,13 @@ test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
     emitModRMmem (regCode rs) m
   _ -> error "invalid TEST operand combination"
 
-------------------------------------------------------------------------
--- MOV
-------------------------------------------------------------------------
-
+-- MOV has multiple encoding forms (not table-driven yet)
 mov :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
 mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
-  -- reg, reg
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
     emit8 0x89
     emitModRMrr rs rd
-
-  -- reg, imm
   (RegOp rd, ImmOp i) -> case swidth @w of
     SW64
       | isImm32' i -> do
@@ -454,31 +559,20 @@ mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
       emitRexOp @w rd
       emit8 (0xB0 + regCode rd)
       emit8 (fromIntegral i)
-
-  -- reg, [mem]
   (RegOp rd, MemOp m) -> do
     emitRexRM @w rd m
     emit8 0x8B
     emitModRMmem (regCode rd) m
-
-  -- [mem], reg
   (MemOp m, RegOp rs) -> do
     emitRexRM @w rs m
     emit8 0x89
     emitModRMmem (regCode rs) m
-
-  -- [mem], imm
   (MemOp m, ImmOp i) -> do
     emitRexRM @w (Reg @w 0) m
     emit8 0xC7
     emitModRMmem 0 m
     emit32 (fromIntegral i)
-
   _ -> error "invalid MOV operand combination"
-
-------------------------------------------------------------------------
--- LEA
-------------------------------------------------------------------------
 
 lea :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()
 lea rd m = do
@@ -487,26 +581,45 @@ lea rd m = do
   emit8 0x8D
   emitModRMmem (regCode rd) m
 
-------------------------------------------------------------------------
--- PUSH / POP (always 64-bit in long mode)
-------------------------------------------------------------------------
+-- Unary r/m
+inc, dec, neg, not :: IsWidth w => Operand w -> CodeGen e s ()
+inc = emitFormUnary 0xFF 0
+dec = emitFormUnary 0xFF 1
+neg = emitFormUnary 0xF7 3
+not = emitFormUnary 0xF7 2
 
-push :: Reg 'W64 -> CodeGen e s ()
-push r = do
+idiv :: IsWidth w => Operand w -> CodeGen e s ()
+idiv = emitFormUnary 0xF7 7
+
+-- Two-byte reg,r/m
+imul :: IsWidth w => Reg w -> Operand w -> CodeGen e s ()
+imul = emitFormTwoByteReg 0xAF
+
+-- Shifts
+shl, shr, sar :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+shl = emitFormShift 4
+shr = emitFormShift 5
+sar = emitFormShift 7
+
+-- Push/Pop (64-bit only)
+push, pop :: Reg 'W64 -> CodeGen e s ()
+push = emitFormOpRd 0x50
+pop  = emitFormOpRd 0x58
+
+-- CALL/JMP via register (FF /2 and FF /4, no REX.W needed)
+call, jmp :: Reg 'W64 -> CodeGen e s ()
+call r = do
   ensureBufferSize maxInsnBytes
   if regExt r then emitRex rexB else return ()
-  emit8 (0x50 + regCode r)
-
-pop :: Reg 'W64 -> CodeGen e s ()
-pop r = do
+  emit8 0xFF
+  emit8 (modRM 3 2 (regCode r))
+jmp r = do
   ensureBufferSize maxInsnBytes
   if regExt r then emitRex rexB else return ()
-  emit8 (0x58 + regCode r)
+  emit8 0xFF
+  emit8 (modRM 3 4 (regCode r))
 
-------------------------------------------------------------------------
--- RET
-------------------------------------------------------------------------
-
+-- Fixed-byte instructions
 ret :: CodeGen e s ()
 ret = ensureBufferSize 1 >> emit8 0xC3
 
@@ -517,28 +630,22 @@ retN n = do
   emit8 (fromIntegral n)
   emit8 (fromIntegral (n `shiftR` 8))
 
-------------------------------------------------------------------------
--- CALL / JMP (indirect via register)
-------------------------------------------------------------------------
+nop :: CodeGen e s ()
+nop = ensureBufferSize 1 >> emit8 0x90
 
-call :: Reg 'W64 -> CodeGen e s ()
-call r = do
-  ensureBufferSize maxInsnBytes
-  if regExt r then emitRex rexB else return ()
-  emit8 0xFF
-  emit8 (modRM 3 2 (regCode r))
+cdq :: CodeGen e s ()
+cdq = ensureBufferSize 1 >> emit8 0x99
 
-jmp :: Reg 'W64 -> CodeGen e s ()
-jmp r = do
-  ensureBufferSize maxInsnBytes
-  if regExt r then emitRex rexB else return ()
-  emit8 0xFF
-  emit8 (modRM 3 4 (regCode r))
+cqo :: CodeGen e s ()
+cqo = ensureBufferSize 2 >> emitRex rexW >> emit8 0x99
 
-------------------------------------------------------------------------
+syscall :: CodeGen e s ()
+syscall = ensureBufferSize 2 >> emit8 0x0F >> emit8 0x05
+
+breakpoint :: CodeGen e s ()
+breakpoint = ensureBufferSize 1 >> emit8 0xCC
+
 -- Conditional jumps
-------------------------------------------------------------------------
-
 data Cond
   = O | NO | B | AE | E | NE | BE | A
   | S | NS | P | NP | L | GE | LE | G
@@ -550,14 +657,13 @@ condCode E  = 0x4; condCode NE = 0x5; condCode BE = 0x6; condCode A  = 0x7
 condCode S  = 0x8; condCode NS = 0x9; condCode P  = 0xA; condCode NP = 0xB
 condCode L  = 0xC; condCode GE = 0xD; condCode LE = 0xE; condCode G  = 0xF
 
--- | Conditional jump to a label. Emits Jcc rel32 (6 bytes).
 jcc :: Cond -> Label -> CodeGen e s ()
 jcc cc lbl = do
   ensureBufferSize 6
   emit8 0x0F
   emit8 (0x80 + condCode cc)
   emitFixup lbl 0 Fixup32
-  emit32 0  -- placeholder
+  emit32 0
 
 je, jne, jl, jge, jle, jg, jb, jae, jbe, ja :: Label -> CodeGen e s ()
 jo, jno, js, jns :: Label -> CodeGen e s ()
@@ -565,152 +671,3 @@ je  = jcc E;  jne = jcc NE; jl  = jcc L;  jge = jcc GE
 jle = jcc LE; jg  = jcc G;  jb  = jcc B;  jae = jcc AE
 jbe = jcc BE; ja  = jcc A;  jo  = jcc O;  jno = jcc NO
 js  = jcc S;  jns = jcc NS
-
-------------------------------------------------------------------------
--- NOP
-------------------------------------------------------------------------
-
-nop :: CodeGen e s ()
-nop = ensureBufferSize 1 >> emit8 0x90
-
-------------------------------------------------------------------------
--- INC / DEC (FF /0 and FF /1 form)
-------------------------------------------------------------------------
-
-inc :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
-inc o = ensureBufferSize maxInsnBytes >> case o of
-  RegOp r -> do
-    emitRexR @w r
-    emit8 0xFF
-    emit8 (modRM 3 0 (regCode r))
-  MemOp m -> do
-    emitRexRM @w (Reg @w 0) m
-    emit8 0xFF
-    emitModRMmem 0 m
-  _ -> error "invalid INC operand"
-
-dec :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
-dec o = ensureBufferSize maxInsnBytes >> case o of
-  RegOp r -> do
-    emitRexR @w r
-    emit8 0xFF
-    emit8 (modRM 3 1 (regCode r))
-  MemOp m -> do
-    emitRexRM @w (Reg @w 0) m
-    emit8 0xFF
-    emitModRMmem 1 m
-  _ -> error "invalid DEC operand"
-
-------------------------------------------------------------------------
--- NEG / NOT (F7 /3 and F7 /2)
-------------------------------------------------------------------------
-
-neg :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
-neg o = ensureBufferSize maxInsnBytes >> case o of
-  RegOp r -> do
-    emitRexR @w r
-    emit8 0xF7
-    emit8 (modRM 3 3 (regCode r))
-  MemOp m -> do
-    emitRexRM @w (Reg @w 0) m
-    emit8 0xF7
-    emitModRMmem 3 m
-  _ -> error "invalid NEG operand"
-
-not :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
-not o = ensureBufferSize maxInsnBytes >> case o of
-  RegOp r -> do
-    emitRexR @w r
-    emit8 0xF7
-    emit8 (modRM 3 2 (regCode r))
-  MemOp m -> do
-    emitRexRM @w (Reg @w 0) m
-    emit8 0xF7
-    emitModRMmem 2 m
-  _ -> error "invalid NOT operand"
-
-------------------------------------------------------------------------
--- IMUL (two-operand: 0F AF /r) / IDIV (F7 /7)
-------------------------------------------------------------------------
-
--- | IMUL dst, src — two-operand form, dst = dst * src
-imul :: forall w e s. IsWidth w => Reg w -> Operand w -> CodeGen e s ()
-imul rd src = ensureBufferSize maxInsnBytes >> case src of
-  RegOp rs -> do
-    emitRexRR @w rd rs
-    emit8 0x0F
-    emit8 0xAF
-    emitModRMrr rd rs
-  MemOp m -> do
-    emitRexRM @w rd m
-    emit8 0x0F
-    emit8 0xAF
-    emitModRMmem (regCode rd) m
-  _ -> error "invalid IMUL operand"
-
--- | IDIV src — RDX:RAX / src, quotient in RAX, remainder in RDX
-idiv :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
-idiv src = ensureBufferSize maxInsnBytes >> case src of
-  RegOp r -> do
-    emitRexR @w r
-    emit8 0xF7
-    emit8 (modRM 3 7 (regCode r))
-  MemOp m -> do
-    emitRexRM @w (Reg @w 0) m
-    emit8 0xF7
-    emitModRMmem 7 m
-  _ -> error "invalid IDIV operand"
-
-------------------------------------------------------------------------
--- Shifts: SHL(4) SHR(5) SAR(7)
-------------------------------------------------------------------------
-
-emitShift :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
-emitShift grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
-  -- reg, imm8
-  (RegOp rd, ImmOp 1) -> do
-    emitRexR @w rd
-    emit8 0xD1
-    emit8 (modRM 3 grp (regCode rd))
-  (RegOp rd, ImmOp i) -> do
-    emitRexR @w rd
-    emit8 0xC1
-    emit8 (modRM 3 grp (regCode rd))
-    emit8 (fromIntegral i)
-  -- reg, CL (CL = Reg 1 W8)
-  (RegOp rd, RegOp (Reg 1)) -> do
-    emitRexR @w rd
-    emit8 0xD3
-    emit8 (modRM 3 grp (regCode rd))
-  _ -> error "invalid shift operand combination"
-
-shl :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-shl = emitShift 4
-
-shr :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-shr = emitShift 5
-
-sar :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
-sar = emitShift 7
-
-------------------------------------------------------------------------
--- CDQ / CQO
-------------------------------------------------------------------------
-
--- | CDQ: sign-extend EAX into EDX:EAX
-cdq :: CodeGen e s ()
-cdq = ensureBufferSize 1 >> emit8 0x99
-
--- | CQO: sign-extend RAX into RDX:RAX
-cqo :: CodeGen e s ()
-cqo = ensureBufferSize 2 >> emitRex rexW >> emit8 0x99
-
-------------------------------------------------------------------------
--- SYSCALL / INT3
-------------------------------------------------------------------------
-
-syscall :: CodeGen e s ()
-syscall = ensureBufferSize 2 >> emit8 0x0F >> emit8 0x05
-
-breakpoint :: CodeGen e s ()
-breakpoint = ensureBufferSize 1 >> emit8 0xCC
