@@ -2,7 +2,8 @@
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 module Main (main) where
 
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, IOException, throwIO, try)
+import System.IO.Error (isDoesNotExistError)
 import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
 import Data.List (isInfixOf)
@@ -94,26 +95,37 @@ emitBytes gen = do
 showHexBytes :: [Word8] -> String
 showHexBytes = concatMap (printf "%02x")
 
+-- Sentinel returned when an external tool is not installed, so differential
+-- tests skip rather than fail on machines (e.g. CI) without nasm/ndisasm.
+toolMissing :: String
+toolMissing = "\0tool-not-installed"
+
 nasmAssemble :: String -> IO (Either String [Word8])
 nasmAssemble asmText =
     withSystemTempDirectory "harpy-test" $ \dir -> do
       let srcFile = dir ++ "/harpy_test.asm"
           outFile = dir ++ "/harpy_test.bin"
       writeFile srcFile $ "BITS 32\n" ++ asmText ++ "\n"
-      (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
-      case ec of
-        ExitFailure _ -> return $ Left $ "nasm: " ++ err
-        ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
+      r <- try (readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] "")
+      case r of
+        Left e
+          | isDoesNotExistError e -> return (Left toolMissing)
+          | otherwise             -> return (Left ("nasm: " ++ show (e :: IOException)))
+        Right (ExitFailure _, _, err) -> return $ Left $ "nasm: " ++ err
+        Right (ExitSuccess, _, _)     -> Right . BS.unpack <$> BS.readFile outFile
 
 ndisasmDecode :: [Word8] -> IO (Either String String)
 ndisasmDecode rawBytes =
     withSystemTempDirectory "harpy-ndisasm" $ \dir -> do
       let binFile = dir ++ "/harpy_test_ndisasm.bin"
       BS.writeFile binFile (BS.pack rawBytes)
-      (ec, out, err) <- readProcessWithExitCode "ndisasm" ["-b", "32", binFile] ""
-      case ec of
-        ExitFailure _ -> return $ Left $ "ndisasm: " ++ err
-        ExitSuccess   -> return $ Right out
+      r <- try (readProcessWithExitCode "ndisasm" ["-b", "32", binFile] "")
+      case r of
+        Left e
+          | isDoesNotExistError e -> return (Left toolMissing)
+          | otherwise             -> return (Left ("ndisasm: " ++ show (e :: IOException)))
+        Right (ExitFailure _, _, err) -> return $ Left $ "ndisasm: " ++ err
+        Right (ExitSuccess, out, _)   -> return $ Right out
 
 ------------------------------------------------------------------------
 -- Test categories
@@ -202,7 +214,8 @@ testDiff _ nasmSrc gen = do
     nr <- nasmAssemble nasmSrc
     case (hr, nr) of
       (Left e, _) -> failWith $ "harpy: " ++ e
-      (_, Left e) -> failWith e
+      (_, Left e) | e == toolMissing -> skip "nasm not installed"
+                  | otherwise        -> failWith e
       (Right hb, Right nb)
         | hb == nb  -> pass
         | otherwise -> failWith $ "harpy=" ++ showHexBytes hb ++ " nasm=" ++ showHexBytes nb
@@ -217,7 +230,8 @@ testNdisasmRoundTrip _ gen expectedMnemonic = do
       Right rawBytes -> do
         dr <- ndisasmDecode rawBytes
         case dr of
-          Left err -> failWith err
+          Left err | err == toolMissing -> skip "ndisasm not installed"
+                   | otherwise          -> failWith err
           Right disasm ->
             if expectedMnemonic `isInfixOf` (map toLower disasm)
               then pass

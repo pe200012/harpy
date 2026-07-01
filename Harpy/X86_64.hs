@@ -43,6 +43,8 @@ module Harpy.X86_64 (
     , iINC, iDEC, iNEG, iNOT, iIDIV, iMUL
     , iSHL, iSHR, iSAR, iROL, iROR
     , iIMUL, iPUSH, iPOP
+    -- * Operand-width constraints
+    , LeaWidth, ImulWidth
     -- * Instructions
     , mov, add, sub, xor, and, or, cmp, test
     , lea
@@ -734,7 +736,20 @@ mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
     emitImmWidth (swidth @w) i
   _ -> failCodeGen (text "invalid MOV operand combination")
 
-lea :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()
+-- | Widths with a LEA form.  LEA has no 8-bit encoding, so @lea al ...@ is
+-- rejected at compile time instead of silently assembling a 32-bit LEA.
+class LeaWidth (w :: Width)
+instance LeaWidth 'W16
+instance LeaWidth 'W32
+instance LeaWidth 'W64
+
+-- | Widths with a two-operand IMUL (0F AF) form.  There is no 8-bit form.
+class ImulWidth (w :: Width)
+instance ImulWidth 'W16
+instance ImulWidth 'W32
+instance ImulWidth 'W64
+
+lea :: forall w e s. (IsWidth w, LeaWidth w) => Reg w -> Mem w -> CodeGen e s ()
 lea rd m = do
   ensureBufferSize maxInsnBytes
   emitRexRM @w rd m
@@ -752,7 +767,7 @@ idiv :: IsWidth w => Operand w -> CodeGen e s ()
 idiv = emitFormUnary 0xF7 7
 
 -- Two-byte reg,r/m
-imul :: IsWidth w => Reg w -> Operand w -> CodeGen e s ()
+imul :: (IsWidth w, ImulWidth w) => Reg w -> Operand w -> CodeGen e s ()
 imul = emitFormTwoByteReg 0xAF
 
 -- SSE/SSE4.1 vector integer subset.
