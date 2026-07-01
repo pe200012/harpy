@@ -59,6 +59,7 @@ Library
     Harpy,
     Harpy.X86_64,
     Harpy.X86_64.Macro,
+    Harpy.X86_64.Call,
     Harpy.X86CodeGen,
     Harpy.X86Assembler,
     Harpy.CodeGenMonad,

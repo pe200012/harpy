@@ -20,6 +20,7 @@ import Harpy.CodeGenMonad
 import Harpy.CodeImage
 import Harpy.X86_64
 import Harpy.X86_64.Macro
+import Harpy.X86_64.Call (invoke, invokeI64)
 
 ------------------------------------------------------------------------
 -- Test harness
@@ -309,4 +310,12 @@ main = runTests
             -- store 42 at [rbp-8], load it back
             mov (mem (disp rbp (-8))) (imm 42 :: Operand 'W64)
             mov (op rax) (mem (disp rbp (-8)))) 42)
+
+    -- Typed invocation tests (Harpy.X86_64.Call)
+    , ("x-invoke",      do
+        r <- invoke (mov (op rax) (imm 42) >> ret)
+        if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
+    , ("x-invokeI64",   do
+        r <- invokeI64 (mov (op rax) (op rdi) >> add (op rax) (imm 1) >> ret) 41
+        if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
     ]
