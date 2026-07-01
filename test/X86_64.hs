@@ -7,14 +7,17 @@ import qualified Data.ByteString as BS
 import Data.Word
 import Data.Int
 import Foreign hiding (xor)
-import System.Exit
-import System.IO
+import System.Exit (ExitCode(..))
+import System.IO.Temp (withSystemTempDirectory)
 import System.Process
+import Test.Tasty (defaultMain, testGroup)
+import Test.Tasty.HUnit (Assertion, assertFailure, testCase)
 import Text.Printf
 
 import Harpy.CodeGenMonad (CodeGen)
 import Harpy.CodeImage
 import Harpy.X86_64
+import qualified Harpy.X86_64.Encoding as Enc
 import Harpy.X86_64.Macro
 import Harpy.X86_64.Call
   ( invoke
@@ -31,26 +34,15 @@ import Harpy.X86_64.Call
 data Result = Pass | Fail String | Skip String
 
 runTests :: [(String, IO Result)] -> IO ()
-runTests tests = do
-    results <- mapM runOne tests
-    let failed  = length [() | Fail _ <- results]
-        skipped = length [() | Skip _ <- results]
-        total   = length results
-    putStrLn ""
-    putStrLn $ show (total - failed - skipped) ++ " passed, "
-            ++ show failed ++ " failed, "
-            ++ show skipped ++ " skipped / " ++ show total ++ " total"
-    if failed > 0 then exitFailure else exitSuccess
+runTests tests =
+    defaultMain $ testGroup "harpy-x86-64-tests" (map toTest tests)
   where
-    runOne (name, act) = do
-        hFlush stdout
-        r <- act
-        case r of
-          Pass   -> putStrLn $ "  OK   " ++ name
-          Fail e -> putStrLn $ "  FAIL " ++ name ++ ": " ++ e
-          Skip e -> putStrLn $ "  SKIP " ++ name ++ ": " ++ e
-        hFlush stdout
-        return r
+    toTest (name, action) = testCase name (assertResult =<< action)
+
+assertResult :: Result -> Assertion
+assertResult Pass = return ()
+assertResult (Fail err) = assertFailure err
+assertResult (Skip reason) = putStrLn ("SKIP: " ++ reason)
 
 pass :: IO Result
 pass = pure Pass
@@ -75,14 +67,15 @@ emitBytes code = do
 
 -- Assemble with nasm in 64-bit mode
 nasmAssemble64 :: String -> IO (Either String [Word8])
-nasmAssemble64 asmText = do
-    let srcFile = "/tmp/harpy_x64_test.asm"
-        outFile = "/tmp/harpy_x64_test.bin"
-    writeFile srcFile $ "BITS 64\n" ++ asmText ++ "\n"
-    (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
-    case ec of
-      ExitFailure _ -> return $ Left $ "nasm: " ++ err
-      ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
+nasmAssemble64 asmText =
+    withSystemTempDirectory "harpy-x64-test" $ \dir -> do
+      let srcFile = dir ++ "/harpy_x64_test.asm"
+          outFile = dir ++ "/harpy_x64_test.bin"
+      writeFile srcFile $ "BITS 64\n" ++ asmText ++ "\n"
+      (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
+      case ec of
+        ExitFailure _ -> return $ Left $ "nasm: " ++ err
+        ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
 
 -- Golden test: emit code, compare against expected bytes
 testGolden :: String -> CodeGen () () () -> [Word8] -> IO Result
@@ -161,6 +154,13 @@ testExecSIMDDotI32x4 = do
       movdFromXmm eax xmm0
       ret
 
+testEncodingMonoid :: IO Result
+testEncodingMonoid =
+    let enc = Enc.bytes [0x66, 0x0f] <> Enc.byte 0xef <> Enc.byte 0xc0
+    in if Enc.encodingSize enc == 4 && Enc.encodingBytes enc == [0x66, 0x0f, 0xef, 0xc0]
+         then pass
+         else failWith $ "unexpected encoding: " ++ show (Enc.encodingSize enc, Enc.encodingBytes enc)
+
 ------------------------------------------------------------------------
 -- Tests
 ------------------------------------------------------------------------
@@ -168,7 +168,8 @@ testExecSIMDDotI32x4 = do
 main :: IO ()
 main = runTests
     [ -- Golden encoding tests (verified against Intel manual / nasm)
-      ("g-ret",         testGolden "ret" ret [0xc3])
+      ("encoding-monoid", testEncodingMonoid)
+    , ("g-ret",         testGolden "ret" ret [0xc3])
     , ("g-nop",         testGolden "nop" nop [0x90])
     , ("g-syscall",     testGolden "syscall" syscall [0x0f, 0x05])
     , ("g-int3",        testGolden "int3" breakpoint [0xcc])

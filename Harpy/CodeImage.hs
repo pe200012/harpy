@@ -43,13 +43,12 @@ import Harpy.CodeGenMonad
     , assembleCodeImage, assembleCodeImageWithConfig
     , CodeGen, ErrMsg, compileExecutableBuffer, withCompiledExecutableBuffer
     )
+import qualified Harpy.Internal.ExecutableMemory as ExecMem
 
-import Control.Exception (bracket)
+import Control.Exception (bracket, onException)
 import qualified Data.ByteString as BS
-import Data.Bits
 import Data.Word
 import Foreign
-import Foreign.C.Types
 import Numeric (showHex)
 import System.IO (hPutStr, hFlush, IOMode(..), withFile)
 import System.Posix.Types (CPid(..))
@@ -66,22 +65,6 @@ executableEntryPtr :: Executable -> Ptr Word8
 executableEntryPtr = execPtr
 
 ------------------------------------------------------------------------
--- FFI
-------------------------------------------------------------------------
-
-foreign import ccall "sys/mman.h mmap"
-  c_mmap :: Ptr () -> CSize -> CInt -> CInt -> CInt -> CLong -> IO (Ptr Word8)
-
-foreign import ccall "sys/mman.h mprotect"
-  c_mprotect :: Ptr Word8 -> CSize -> CInt -> IO CInt
-
-foreign import ccall "sys/mman.h munmap"
-  c_munmap :: Ptr Word8 -> CSize -> IO CInt
-
-pageAlign :: Int -> Int
-pageAlign n = (n + 4095) .&. complement 4095
-
-------------------------------------------------------------------------
 -- Loading
 ------------------------------------------------------------------------
 
@@ -91,21 +74,12 @@ loadCodeImage :: CodeImage -> IO Executable
 loadCodeImage img = do
     let bytes     = codeImageBytes img
         len       = BS.length bytes
-        allocSize = pageAlign (max len 1)
-    buf <- c_mmap nullPtr (fromIntegral allocSize)
-                  (0x1 .|. 0x2)   -- PROT_READ | PROT_WRITE
-                  (0x2 .|. 0x20)  -- MAP_PRIVATE | MAP_ANONYMOUS
-                  (-1) 0
-    if buf == intPtrToPtr (-1)
-      then ioError (userError "Harpy.CodeImage: mmap failed")
-      else do
-        BS.useAsCStringLen bytes $ \(src, srcLen) ->
-          copyBytes buf (castPtr src) srcLen
-        rc <- c_mprotect buf (fromIntegral allocSize) (0x1 .|. 0x4)
-        if rc /= 0
-          then do _ <- c_munmap buf (fromIntegral allocSize)
-                  ioError (userError "Harpy.CodeImage: mprotect RX failed")
-          else return (Executable buf allocSize)
+    mapping <- ExecMem.allocate len
+    (do BS.useAsCStringLen bytes $ \(src, srcLen) ->
+          copyBytes (ExecMem.mappingPtr mapping) (castPtr src) srcLen
+        ExecMem.protect ExecMem.ReadExecute mapping
+        return (Executable (ExecMem.mappingPtr mapping) (ExecMem.mappingSize mapping)))
+      `onException` ExecMem.free mapping
 
 -- | Compile code directly into executable memory.
 --
@@ -132,7 +106,7 @@ withExecutable img = bracket (loadCodeImage img) freeExecutable
 
 -- | Free the executable memory.
 freeExecutable :: Executable -> IO ()
-freeExecutable (Executable p sz) = do _ <- c_munmap p (fromIntegral sz); return ()
+freeExecutable (Executable p sz) = ExecMem.free (ExecMem.Mapping p sz)
 
 ------------------------------------------------------------------------
 -- Inspection helpers

@@ -66,16 +66,16 @@ import qualified Prelude
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import Data.Int
 import Data.Word
-import Foreign.Ptr (Ptr)
 
 import Harpy.CodeGenMonad
     ( CodeGen, Label
-    , emit8, emit32, emit32At
-    , ensureBufferSize, getCodeOffset, getBasePtr
+    , emit8, emit32
+    , ensureBufferSize, getCodeOffset
     , newLabel, newNamedLabel, setLabel, defineLabel, (@@)
     , emitFixup, FixupKind(..)
     , tryLabelOffset
     )
+import qualified Harpy.X86_64.Encoding as Enc
 
 ------------------------------------------------------------------------
 -- Width
@@ -297,6 +297,40 @@ emitRexXMMGpr reg rm = do
   let bits = (if xmmExt reg then rexR else 0)
          .|. (if regExt rm then rexB else 0)
   if bits /= 0 then emitRex bits else return ()
+
+rexEncoding :: Word8 -> Enc.Encoding
+rexEncoding bits =
+  if bits == 0 then mempty else Enc.byte (0x40 .|. bits)
+
+rexEncodingXMMRR :: XMM -> XMM -> Enc.Encoding
+rexEncodingXMMRR reg rm =
+  rexEncoding $
+       (if xmmExt reg then rexR else 0)
+  .|. (if xmmExt rm then rexB else 0)
+
+rexEncodingXMMRM :: XMM -> Mem w -> Enc.Encoding
+rexEncodingXMMRM reg m =
+  let bBit = case memBase m of
+               Just r | regExt r -> rexB
+               _ -> 0
+      xBit = case memIndex m of
+               Just (r, _) | regExt r -> rexX
+               _ -> 0
+  in rexEncoding $
+       (if xmmExt reg then rexR else 0) .|. xBit .|. bBit
+
+rexEncodingXMMGpr :: XMM -> Reg w -> Enc.Encoding
+rexEncodingXMMGpr reg rm =
+  rexEncoding $
+       (if xmmExt reg then rexR else 0)
+  .|. (if regExt rm then rexB else 0)
+
+xmmRR :: [Word8] -> [Word8] -> XMM -> XMM -> Enc.Encoding
+xmmRR prefixes opcode dst src =
+     Enc.bytes prefixes
+  <> rexEncodingXMMRR dst src
+  <> Enc.bytes opcode
+  <> Enc.byte (modRM 3 (xmmCode dst) (xmmCode src))
 
 -- ModRM byte: mod(2) reg(3) rm(3)
 modRM :: Word8 -> Word8 -> Word8 -> Word8
@@ -681,69 +715,46 @@ imul = emitFormTwoByteReg 0xAF
 
 -- SSE/SSE4.1 vector integer subset.
 pxorX :: XMM -> XMM -> CodeGen e s ()
-pxorX dst src = do
-  ensureBufferSize maxInsnBytes
-  emit8 0x66
-  emitRexXMMRR dst src
-  emit8 0x0F
-  emit8 0xEF
-  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+pxorX dst src =
+  Enc.emitEncoding (xmmRR [0x66] [0x0F, 0xEF] dst src)
 
 movdquLoad :: XMM -> Mem w -> CodeGen e s ()
 movdquLoad dst src = do
   ensureBufferSize maxInsnBytes
-  emit8 0xF3
-  emitRexXMMRM dst src
-  emit8 0x0F
-  emit8 0x6F
+  Enc.emitEncoding $
+       Enc.byte 0xF3
+    <> rexEncodingXMMRM dst src
+    <> Enc.bytes [0x0F, 0x6F]
   emitModRMmem (xmmCode dst) src
 
 movdquXmm :: XMM -> XMM -> CodeGen e s ()
-movdquXmm dst src = do
-  ensureBufferSize maxInsnBytes
-  emit8 0xF3
-  emitRexXMMRR dst src
-  emit8 0x0F
-  emit8 0x6F
-  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+movdquXmm dst src =
+  Enc.emitEncoding (xmmRR [0xF3] [0x0F, 0x6F] dst src)
 
 pmulld :: XMM -> XMM -> CodeGen e s ()
-pmulld dst src = do
-  ensureBufferSize maxInsnBytes
-  emit8 0x66
-  emitRexXMMRR dst src
-  emit8 0x0F
-  emit8 0x38
-  emit8 0x40
-  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+pmulld dst src =
+  Enc.emitEncoding (xmmRR [0x66] [0x0F, 0x38, 0x40] dst src)
 
 paddd :: XMM -> XMM -> CodeGen e s ()
-paddd dst src = do
-  ensureBufferSize maxInsnBytes
-  emit8 0x66
-  emitRexXMMRR dst src
-  emit8 0x0F
-  emit8 0xFE
-  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+paddd dst src =
+  Enc.emitEncoding (xmmRR [0x66] [0x0F, 0xFE] dst src)
 
 psrldq :: XMM -> Word8 -> CodeGen e s ()
-psrldq dst amount = do
-  ensureBufferSize maxInsnBytes
-  emit8 0x66
-  if xmmExt dst then emitRex rexB else return ()
-  emit8 0x0F
-  emit8 0x73
-  emit8 (modRM 3 3 (xmmCode dst))
-  emit8 amount
+psrldq dst amount =
+  Enc.emitEncoding $
+       Enc.byte 0x66
+    <> rexEncoding (if xmmExt dst then rexB else 0)
+    <> Enc.bytes [0x0F, 0x73]
+    <> Enc.byte (modRM 3 3 (xmmCode dst))
+    <> Enc.byte amount
 
 movdFromXmm :: Reg 'W32 -> XMM -> CodeGen e s ()
-movdFromXmm dst src = do
-  ensureBufferSize maxInsnBytes
-  emit8 0x66
-  emitRexXMMGpr src dst
-  emit8 0x0F
-  emit8 0x7E
-  emit8 (modRM 3 (xmmCode src) (regCode dst))
+movdFromXmm dst src =
+  Enc.emitEncoding $
+       Enc.byte 0x66
+    <> rexEncodingXMMGpr src dst
+    <> Enc.bytes [0x0F, 0x7E]
+    <> Enc.byte (modRM 3 (xmmCode src) (regCode dst))
 
 -- Shifts
 shl, shr, sar :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()

@@ -10,13 +10,16 @@ import Data.Word
 import Foreign
 import Foreign.C.Types
 import Numeric (readHex)
-import System.Exit
-import System.IO
+import System.Exit (ExitCode(..))
+import System.IO.Temp (withSystemTempDirectory)
 import System.Process
+import Test.Tasty (defaultMain, testGroup)
+import Test.Tasty.HUnit (Assertion, assertFailure, testCase)
 import Text.Printf
 
 import Harpy hiding (xor, and, or)
 import qualified Harpy (xor, and, or)
+import qualified Harpy.Internal.ExecutableMemory as ExecMem
 import Harpy.X86Disassembler
 
 $(callDecl "callAsWord32" [t|Word32 -> IO Word32|])
@@ -28,26 +31,15 @@ $(callDecl "callAsWord32" [t|Word32 -> IO Word32|])
 data Result = Pass | Fail String | Skip String
 
 runTests :: [(String, IO Result)] -> IO ()
-runTests tests = do
-    results <- mapM runOne tests
-    let failed  = length [() | Fail _ <- results]
-        skipped = length [() | Skip _ <- results]
-        total   = length results
-    putStrLn ""
-    putStrLn $ show (total - failed - skipped) ++ " passed, "
-            ++ show failed ++ " failed, "
-            ++ show skipped ++ " skipped / " ++ show total ++ " total"
-    if failed > 0 then exitFailure else exitSuccess
+runTests tests =
+    defaultMain $ testGroup "harpy-tests" (map toTest tests)
   where
-    runOne (name, act) = do
-        hFlush stdout
-        r <- act
-        case r of
-          Pass   -> putStrLn $ "  OK   " ++ name
-          Fail e -> putStrLn $ "  FAIL " ++ name ++ ": " ++ e
-          Skip e -> putStrLn $ "  SKIP " ++ name ++ ": " ++ e
-        hFlush stdout
-        return r
+    toTest (name, action) = testCase name (assertResult =<< action)
+
+assertResult :: Result -> Assertion
+assertResult Pass = return ()
+assertResult (Fail err) = assertFailure err
+assertResult (Skip reason) = putStrLn ("SKIP: " ++ reason)
 
 pass :: IO Result
 pass = pure Pass
@@ -103,23 +95,25 @@ showHexBytes :: [Word8] -> String
 showHexBytes = concatMap (printf "%02x")
 
 nasmAssemble :: String -> IO (Either String [Word8])
-nasmAssemble asmText = do
-    let srcFile = "/tmp/harpy_test.asm"
-        outFile = "/tmp/harpy_test.bin"
-    writeFile srcFile $ "BITS 32\n" ++ asmText ++ "\n"
-    (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
-    case ec of
-      ExitFailure _ -> return $ Left $ "nasm: " ++ err
-      ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
+nasmAssemble asmText =
+    withSystemTempDirectory "harpy-test" $ \dir -> do
+      let srcFile = dir ++ "/harpy_test.asm"
+          outFile = dir ++ "/harpy_test.bin"
+      writeFile srcFile $ "BITS 32\n" ++ asmText ++ "\n"
+      (ec, _, err) <- readProcessWithExitCode "nasm" ["-f", "bin", "-o", outFile, srcFile] ""
+      case ec of
+        ExitFailure _ -> return $ Left $ "nasm: " ++ err
+        ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
 
 ndisasmDecode :: [Word8] -> IO (Either String String)
-ndisasmDecode rawBytes = do
-    let binFile = "/tmp/harpy_test_ndisasm.bin"
-    BS.writeFile binFile (BS.pack rawBytes)
-    (ec, out, err) <- readProcessWithExitCode "ndisasm" ["-b", "32", binFile] ""
-    case ec of
-      ExitFailure _ -> return $ Left $ "ndisasm: " ++ err
-      ExitSuccess   -> return $ Right out
+ndisasmDecode rawBytes =
+    withSystemTempDirectory "harpy-ndisasm" $ \dir -> do
+      let binFile = dir ++ "/harpy_test_ndisasm.bin"
+      BS.writeFile binFile (BS.pack rawBytes)
+      (ec, out, err) <- readProcessWithExitCode "ndisasm" ["-b", "32", binFile] ""
+      case ec of
+        ExitFailure _ -> return $ Left $ "ndisasm: " ++ err
+        ExitSuccess   -> return $ Right out
 
 ------------------------------------------------------------------------
 -- Test categories
@@ -167,6 +161,17 @@ testWXPatternFill = do
         if readBack == take fillSize pattern
           then pass
           else failWith "pattern mismatch after W->X transition"
+
+testExecutableMemoryAPI :: IO Result
+testExecutableMemoryAPI =
+    ExecMem.withMapping 16 $ \mapping -> do
+      let buf = ExecMem.mappingPtr mapping
+      pokeByteOff buf 0 (0x2a :: Word8)
+      ExecMem.protect ExecMem.ReadExecute mapping
+      actual <- peekByteOff buf 0 :: IO Word8
+      if actual == 0x2a && ExecMem.mappingSize mapping >= 16
+        then pass
+        else failWith $ "expected mapped byte 0x2a, got " ++ show actual
 
 -- 3. Harpy API execution: emit simple functions, call, assert return value
 testHarpyMovRet :: Word32 -> IO Result
@@ -517,6 +522,7 @@ main = runTests
     [ -- Memory subsystem
       ("mmap-wx-transition",     testRawMmap)
     , ("wx-pattern-fill",        testWXPatternFill)
+    , ("executable-memory-api",  testExecutableMemoryAPI)
 
     -- Harpy API execution smoke tests
     , ("exec-mov-ret-42",        testHarpyMovRet 42)
