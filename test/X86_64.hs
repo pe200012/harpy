@@ -15,6 +15,7 @@ import Text.Printf
 import Harpy.CodeGenMonad
     ( CodeGen, runCodeGen, defaultCodeGenConfig
     , assembleCodeImage
+    , newLabel, defineLabel
     )
 import Harpy.CodeImage
 import Harpy.X86_64
@@ -261,4 +262,33 @@ main = runTests
     , ("x-r8-r9",       testExec "r8+r9=42"
         (mov (op r8) (imm 20) >> mov (op r9) (imm 22)
          >> mov (op rax) (op r8) >> add (op rax) (op r9) >> ret) 42)
+
+    -- Branch relaxation tests
+    , ("g-jcc-short-back", testGolden "backward jcc short (2 bytes)"
+        (do lbl <- newLabel
+            defineLabel lbl
+            nop  -- 1 byte
+            je lbl)
+        [0x90, 0x74, 0xfd])  -- nop; je -3 (back over nop + 2-byte je)
+    , ("x-loop-short",   testExec "loop with short backward jcc"
+        (do mov (op rcx) (imm 10)
+            xor (op rax) (op rax)
+            lbl <- newLabel
+            defineLabel lbl
+            add (op rax) (imm 1)
+            dec (op rcx)
+            jne lbl
+            ret) 10)
+    , ("x-jmpLabel",     testExec "jmpLabel forward"
+        (do lbl <- newLabel
+            mov (op rax) (imm 99)
+            jmpLabel lbl
+            mov (op rax) (imm 0)
+            defineLabel lbl
+            ret) 99)
+    , ("g-jmpLabel-short-back", testGolden "backward jmpLabel short"
+        (do lbl <- newLabel
+            defineLabel lbl
+            jmpLabel lbl)
+        [0xeb, 0xfe])  -- jmp -2 (jump to self)
     ]

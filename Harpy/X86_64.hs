@@ -45,6 +45,7 @@ module Harpy.X86_64 (
     , call, jmp
     , jcc, Cond(..)
     , je, jne, jl, jge, jle, jg, jb, jae, jbe, ja, jo, jno, js, jns
+    , jmpLabel
     , nop
     , inc, dec, neg, not
     , imul, idiv
@@ -69,6 +70,7 @@ import Harpy.CodeGenMonad
     , ensureBufferSize, getCodeOffset, getBasePtr
     , newLabel, newNamedLabel, setLabel, defineLabel, (@@)
     , emitFixup, FixupKind(..)
+    , tryLabelOffset
     )
 
 ------------------------------------------------------------------------
@@ -657,13 +659,33 @@ condCode E  = 0x4; condCode NE = 0x5; condCode BE = 0x6; condCode A  = 0x7
 condCode S  = 0x8; condCode NS = 0x9; condCode P  = 0xA; condCode NP = 0xB
 condCode L  = 0xC; condCode GE = 0xD; condCode LE = 0xE; condCode G  = 0xF
 
+-- | Conditional jump with automatic short/near selection.
+-- For backward jumps (label already defined), emits the 2-byte short
+-- form (7x rel8) when the displacement fits in ±127 bytes.
+-- For forward jumps or out-of-range backward jumps, emits the 6-byte
+-- near form (0F 8x rel32).
 jcc :: Cond -> Label -> CodeGen e s ()
 jcc cc lbl = do
   ensureBufferSize 6
-  emit8 0x0F
-  emit8 (0x80 + condCode cc)
-  emitFixup lbl 0 Fixup32
-  emit32 0
+  mlabOfs <- tryLabelOffset lbl
+  curOfs  <- getCodeOffset
+  case mlabOfs of
+    Just labOfs ->
+      let shortDisp = labOfs - (curOfs + 2)  -- rel8 is relative to end of 2-byte insn
+      in if shortDisp >= -128 && shortDisp <= 127
+        then do
+          emit8 (0x70 + condCode cc)
+          emit8 (fromIntegral shortDisp)
+        else do
+          emit8 0x0F
+          emit8 (0x80 + condCode cc)
+          emitFixup lbl 0 Fixup32
+          emit32 0
+    Nothing -> do
+      emit8 0x0F
+      emit8 (0x80 + condCode cc)
+      emitFixup lbl 0 Fixup32
+      emit32 0
 
 je, jne, jl, jge, jle, jg, jb, jae, jbe, ja :: Label -> CodeGen e s ()
 jo, jno, js, jns :: Label -> CodeGen e s ()
@@ -671,3 +693,25 @@ je  = jcc E;  jne = jcc NE; jl  = jcc L;  jge = jcc GE
 jle = jcc LE; jg  = jcc G;  jb  = jcc B;  jae = jcc AE
 jbe = jcc BE; ja  = jcc A;  jo  = jcc O;  jno = jcc NO
 js  = jcc S;  jns = jcc NS
+
+-- | Unconditional jump to label with short/near relaxation.
+jmpLabel :: Label -> CodeGen e s ()
+jmpLabel lbl = do
+  ensureBufferSize 5
+  mlabOfs <- tryLabelOffset lbl
+  curOfs  <- getCodeOffset
+  case mlabOfs of
+    Just labOfs ->
+      let shortDisp = labOfs - (curOfs + 2)
+      in if shortDisp >= -128 && shortDisp <= 127
+        then do
+          emit8 0xEB
+          emit8 (fromIntegral shortDisp)
+        else do
+          emit8 0xE9
+          emitFixup lbl 0 Fixup32
+          emit32 0
+    Nothing -> do
+      emit8 0xE9
+      emitFixup lbl 0 Fixup32
+      emit32 0

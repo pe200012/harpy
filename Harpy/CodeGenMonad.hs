@@ -63,6 +63,7 @@ module Harpy.CodeGenMonad(
           (@@),
           emitFixup,
           labelAddress,
+          tryLabelOffset,
           emitRelocInfo,
     -- ** Code emission
           emit8,
@@ -644,6 +645,14 @@ labelAddress (Label lab name) = do
     Just (labBuf, labOfs, _) -> return $ plusPtr labBuf labOfs
     Nothing -> fail $ "Label " ++ show lab ++ "(" ++ name ++ ") not yet defined"
 
+-- | Try to get the buffer offset of a label, if it is already defined.
+-- Returns @Nothing@ for forward (not yet defined) labels.
+tryLabelOffset :: Label -> CodeGen e s (Maybe Int)
+tryLabelOffset (Label lab _) = do
+  state <- getInternalState
+  case Map.lookup lab (definedLabels state) of
+    Just (_, labOfs, _) -> return (Just labOfs)
+    Nothing -> return Nothing
 
 -- | Disassemble all code buffers.  The result is a list of
 -- disassembled instructions which can be converted to strings using
