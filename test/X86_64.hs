@@ -2,6 +2,7 @@
              ForeignFunctionInterface, GADTs #-}
 module Main (main) where
 
+import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
 import Data.Word
 import Data.Int
@@ -325,4 +326,80 @@ main = runTests
         case r of
           Left _  -> pass
           Right _ -> failWith "expected failure for undefined label")
+
+    -- Branch boundary tests
+    , ("b-jcc-near-back", do
+        -- 126 NOPs + backward je should use near (6-byte) form because
+        -- the short displacement would be exactly -128 (out of range for
+        -- the 2-byte branch + body, which is -(126+2) = -128).
+        -- Actually -128 IS in range for rel8 (signed byte: -128..127).
+        -- 127 NOPs would give -(127+2) = -129 which IS out of range.
+        r <- emitBytes $ do
+          lbl <- newLabel
+          defineLabel lbl
+          replicateM_ 127 nop  -- 127 bytes
+          je lbl               -- displacement = -(127+2) = -129: near
+        case r of
+          Left err -> failWith err
+          Right bs ->
+            let len = length bs
+                -- near form: 127 nops (127 bytes) + 6-byte jcc = 133
+                -- short form: 127 nops + 2-byte jcc = 129
+            in if len == 133 then pass
+               else failWith $ "expected 133 bytes (near), got " ++ show len)
+
+    , ("b-jcc-short-boundary", do
+        -- 126 NOPs: displacement = -(126+2) = -128, which fits rel8
+        r <- emitBytes $ do
+          lbl <- newLabel
+          defineLabel lbl
+          replicateM_ 126 nop
+          je lbl
+        case r of
+          Left err -> failWith err
+          Right bs ->
+            let len = length bs
+            in if len == 128 then pass  -- 126 nops + 2-byte short je
+               else failWith $ "expected 128 bytes (short), got " ++ show len)
+
+    -- Additional instruction coverage
+    , ("x-sar",         testExec "sar -8 >> 1 = -4"
+        (mov (op rax) (imm (-8)) >> sar (op rax) (imm 1) >> ret)
+        (fromIntegral (-4 :: Int64)))
+    , ("x-test-jz",     testExec "test rax,rax; je taken"
+        (do xor (op rax) (op rax)
+            test (op rax) (op rax)
+            lbl <- newLabel
+            je lbl
+            mov (op rax) (imm 1)
+            defineLabel lbl
+            mov (op rax) (imm 42)
+            ret) 42)
+    , ("x-cmp-jl",      testExec "cmp 5,10; jl taken"
+        (do mov (op rax) (imm 5)
+            cmp (op rax) (imm 10)
+            lbl <- newLabel
+            jl lbl
+            mov (op rax) (imm 0)
+            defineLabel lbl
+            mov (op rax) (imm 42)
+            ret) 42)
+    , ("x-not",         testExec "not 0 = -1 (0xffffffffffffffff)"
+        (xor (op rax) (op rax)
+         >> Harpy.X86_64.not (op rax) >> ret) 0xffffffffffffffff)
+    , ("x-idiv",        testExec "42 / 6 = 7"
+        (do mov (op rax) (imm 42)
+            xor (op rdx) (op rdx)  -- clear rdx for unsigned div
+            mov (op rcx) (imm 6)
+            idiv (op rcx)
+            ret) 7)
+    , ("x-lea",         testExec "lea rax, [rcx+rdx]"
+        (do mov (op rcx) (imm 20)
+            mov (op rdx) (imm 22)
+            lea rax (Mem (Just rcx) (Just (rdx, S1)) 0)
+            ret) 42)
+    , ("x-retN",        testExec "retN 0 returns normally"
+        (mov (op rax) (imm 42) >> retN 0) 42)
+    , ("d-inc-eax",     testDiff "inc eax" (inc (op eax)))
+    , ("d-neg-rcx",     testDiff "neg rcx" (neg (op rcx)))
     ]
