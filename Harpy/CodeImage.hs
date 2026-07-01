@@ -25,6 +25,8 @@ module Harpy.CodeImage(
     , assembleCodeImageWithConfig
     -- * Loading and executing
     , loadCodeImage
+    , compileExecutable
+    , withCompiledExecutable
     , withExecutable
     , freeExecutable
     , executableEntryPtr
@@ -39,6 +41,7 @@ module Harpy.CodeImage(
 import Harpy.CodeGenMonad
     ( CodeImage(..), Section(..), SectionKind(..), CISymbol(..)
     , assembleCodeImage, assembleCodeImageWithConfig
+    , CodeGen, ErrMsg, compileExecutableBuffer, withCompiledExecutableBuffer
     )
 
 import Control.Exception (bracket)
@@ -103,6 +106,25 @@ loadCodeImage img = do
           then do _ <- c_munmap buf (fromIntegral allocSize)
                   ioError (userError "Harpy.CodeImage: mprotect RX failed")
           else return (Executable buf allocSize)
+
+-- | Compile code directly into executable memory.
+--
+-- This avoids materializing a 'CodeImage' and then copying its bytes into
+-- a second mapping.  The caller owns the returned 'Executable' and must
+-- release it with 'freeExecutable'.
+compileExecutable :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg (a, Executable))
+compileExecutable code uenv ustate = do
+    (ustate', res) <- compileExecutableBuffer code uenv ustate
+    case res of
+      Left err -> return (ustate', Left err)
+      Right (val, ptr, size) -> return (ustate', Right (val, Executable ptr size))
+
+-- | Compile code directly into executable memory, run an action, and free
+-- the executable mapping afterwards.
+withCompiledExecutable :: CodeGen e s a -> e -> s -> (a -> Executable -> IO b) -> IO (s, Either ErrMsg b)
+withCompiledExecutable code uenv ustate action =
+    withCompiledExecutableBuffer code uenv ustate $ \val ptr size ->
+      action val (Executable ptr size)
 
 -- | Load a 'CodeImage', run an action with the executable, then free it.
 withExecutable :: CodeImage -> (Executable -> IO a) -> IO a

@@ -13,7 +13,7 @@
 module Harpy.X86_64 (
     -- * Width and register types
       Width(..), SWidth(..), IsWidth(..)
-    , Reg(..)
+    , Reg(..), XMM(..)
     -- * Named registers (64-bit)
     , rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi
     , r8, r9, r10, r11, r12, r13, r14, r15
@@ -24,6 +24,9 @@ module Harpy.X86_64 (
     , ax, cx, dx, bx, sp, bp, si, di
     -- * Named registers (8-bit)
     , al, cl, dl, bl
+    -- * Named XMM registers
+    , xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7
+    , xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15
     -- * Memory operands
     , Mem(..), addr, base, index, disp
     -- * Operand type
@@ -50,6 +53,7 @@ module Harpy.X86_64 (
     , inc, dec, neg, not
     , imul, idiv
     , shl, shr, sar
+    , pxorX, movdquLoad, movdquXmm, pmulld, paddd, psrldq, movdFromXmm
     , cdq, cqo
     , syscall
     , breakpoint
@@ -105,11 +109,21 @@ data Reg (w :: Width) where
 deriving instance Show (Reg w)
 deriving instance Eq (Reg w)
 
+-- | XMM register used by the small SSE/SSE4.1 instruction subset.
+data XMM = XMM Word8
+  deriving (Show, Eq)
+
 regCode :: Reg w -> Word8
 regCode (Reg c) = c .&. 0x07
 
 regExt :: Reg w -> Bool
 regExt (Reg c) = testBit c 3
+
+xmmCode :: XMM -> Word8
+xmmCode (XMM c) = c .&. 0x07
+
+xmmExt :: XMM -> Bool
+xmmExt (XMM c) = testBit c 3
 
 -- 64-bit
 rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi :: Reg 'W64
@@ -135,6 +149,14 @@ sp = Reg 4; bp = Reg 5; si = Reg 6; di = Reg 7
 -- 8-bit (low only; no AH/BH/CH/DH)
 al, cl, dl, bl :: Reg 'W8
 al = Reg 0; cl = Reg 1; dl = Reg 2; bl = Reg 3
+
+-- XMM registers
+xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7 :: XMM
+xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15 :: XMM
+xmm0 = XMM 0; xmm1 = XMM 1; xmm2 = XMM 2; xmm3 = XMM 3
+xmm4 = XMM 4; xmm5 = XMM 5; xmm6 = XMM 6; xmm7 = XMM 7
+xmm8 = XMM 8; xmm9 = XMM 9; xmm10 = XMM 10; xmm11 = XMM 11
+xmm12 = XMM 12; xmm13 = XMM 13; xmm14 = XMM 14; xmm15 = XMM 15
 
 ------------------------------------------------------------------------
 -- Memory operands
@@ -250,6 +272,31 @@ emitRexR rm = do
 -- REX for single register in opcode +rd (e.g. PUSH 50+rd, POP 58+rd, MOV B8+rd)
 emitRexOp :: forall w e s. IsWidth w => Reg w -> CodeGen e s ()
 emitRexOp = emitRexR @w
+
+-- REX for XMM register instructions. The R bit encodes ModRM.reg and
+-- the B bit encodes ModRM.r/m.
+emitRexXMMRR :: XMM -> XMM -> CodeGen e s ()
+emitRexXMMRR reg rm = do
+  let bits = (if xmmExt reg then rexR else 0)
+         .|. (if xmmExt rm then rexB else 0)
+  if bits /= 0 then emitRex bits else return ()
+
+emitRexXMMRM :: XMM -> Mem w -> CodeGen e s ()
+emitRexXMMRM reg m = do
+  let bBit = case memBase m of
+               Just r | regExt r -> rexB
+               _ -> 0
+      xBit = case memIndex m of
+               Just (r, _) | regExt r -> rexX
+               _ -> 0
+      bits = (if xmmExt reg then rexR else 0) .|. xBit .|. bBit
+  if bits /= 0 then emitRex bits else return ()
+
+emitRexXMMGpr :: XMM -> Reg w -> CodeGen e s ()
+emitRexXMMGpr reg rm = do
+  let bits = (if xmmExt reg then rexR else 0)
+         .|. (if regExt rm then rexB else 0)
+  if bits /= 0 then emitRex bits else return ()
 
 -- ModRM byte: mod(2) reg(3) rm(3)
 modRM :: Word8 -> Word8 -> Word8 -> Word8
@@ -631,6 +678,72 @@ idiv = emitFormUnary 0xF7 7
 -- Two-byte reg,r/m
 imul :: IsWidth w => Reg w -> Operand w -> CodeGen e s ()
 imul = emitFormTwoByteReg 0xAF
+
+-- SSE/SSE4.1 vector integer subset.
+pxorX :: XMM -> XMM -> CodeGen e s ()
+pxorX dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0x66
+  emitRexXMMRR dst src
+  emit8 0x0F
+  emit8 0xEF
+  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+
+movdquLoad :: XMM -> Mem w -> CodeGen e s ()
+movdquLoad dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0xF3
+  emitRexXMMRM dst src
+  emit8 0x0F
+  emit8 0x6F
+  emitModRMmem (xmmCode dst) src
+
+movdquXmm :: XMM -> XMM -> CodeGen e s ()
+movdquXmm dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0xF3
+  emitRexXMMRR dst src
+  emit8 0x0F
+  emit8 0x6F
+  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+
+pmulld :: XMM -> XMM -> CodeGen e s ()
+pmulld dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0x66
+  emitRexXMMRR dst src
+  emit8 0x0F
+  emit8 0x38
+  emit8 0x40
+  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+
+paddd :: XMM -> XMM -> CodeGen e s ()
+paddd dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0x66
+  emitRexXMMRR dst src
+  emit8 0x0F
+  emit8 0xFE
+  emit8 (modRM 3 (xmmCode dst) (xmmCode src))
+
+psrldq :: XMM -> Word8 -> CodeGen e s ()
+psrldq dst amount = do
+  ensureBufferSize maxInsnBytes
+  emit8 0x66
+  if xmmExt dst then emitRex rexB else return ()
+  emit8 0x0F
+  emit8 0x73
+  emit8 (modRM 3 3 (xmmCode dst))
+  emit8 amount
+
+movdFromXmm :: Reg 'W32 -> XMM -> CodeGen e s ()
+movdFromXmm dst src = do
+  ensureBufferSize maxInsnBytes
+  emit8 0x66
+  emitRexXMMGpr src dst
+  emit8 0x0F
+  emit8 0x7E
+  emit8 (modRM 3 (xmmCode src) (regCode dst))
 
 -- Shifts
 shl, shr, sar :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()

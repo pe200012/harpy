@@ -79,6 +79,9 @@ module Harpy.CodeGenMonad(
     -- ** Producing a CodeImage
           assembleCodeImage,
           assembleCodeImageWithConfig,
+    -- ** Producing executable buffers
+          compileExecutableBuffer,
+          withCompiledExecutableBuffer,
     -- ** Calling generated functions
           callDecl,
     -- ** Interface to disassembler
@@ -88,6 +91,7 @@ module Harpy.CodeGenMonad(
 import Prelude hiding ((<>))
 import qualified Harpy.X86Disassembler as Dis
 
+import Control.Exception (bracket, onException)
 import Control.Applicative
 import Control.Monad
 
@@ -395,6 +399,54 @@ assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
                            , codeImageSymbols  = syms }
                mmapFree (buffer finalState) (bufferSize finalState)
                return (ustate', Right (val, img))
+
+-- | Compile generated code directly into an executable mmap buffer.
+--
+-- The returned pointer owns a whole page-aligned mapping.  Callers must
+-- release it with the same mapping size via @munmap@; higher-level users
+-- should prefer 'Harpy.CodeImage.compileExecutable' or
+-- 'Harpy.CodeImage.withCompiledExecutable'.
+compileExecutableBuffer :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg (a, Ptr Word8, Int))
+compileExecutableBuffer (CodeGen cg) uenv ustate =
+    do let initSize = pageAlign (max (codeBufferSize defaultCodeGenConfig) 64)
+       buf <- mmapRW initSize
+       let env = CodeGenEnv {tailContext = True}
+       let state = emptyCodeGenState{buffer = buf,
+                                     firstBuffer = buf,
+                                     bufferOfs = 0,
+                                     bufferSize = initSize,
+                                     config = defaultCodeGenConfig{customCodeBuffer = Nothing}}
+       ((ustate', finalState), res) <- cg (uenv, env) (ustate, state)
+       case res of
+         Left err -> do mmapFree (buffer finalState) (bufferSize finalState)
+                        return (ustate', Left err)
+         Right val -> do
+           let pending = pendingFixups finalState
+               finalBuf = firstBuffer finalState
+               finalSize = bufferSize finalState
+           if Prelude.not (Map.null pending)
+             then do
+               let undefs = Map.keys pending
+                   msg = "undefined labels: " ++ show undefs
+               mmapFree finalBuf finalSize
+               return (ustate', Left (text msg))
+             else do
+               mprotectRX finalBuf finalSize `onException` mmapFree finalBuf finalSize
+               return (ustate', Right (val, finalBuf, finalSize))
+
+-- | Compile generated code into executable memory, run an action, and
+-- always release the mapping afterwards.
+withCompiledExecutableBuffer :: CodeGen e s a -> e -> s -> (a -> Ptr Word8 -> Int -> IO b) -> IO (s, Either ErrMsg b)
+withCompiledExecutableBuffer code uenv ustate action = do
+    (ustate', res) <- compileExecutableBuffer code uenv ustate
+    case res of
+      Left err -> return (ustate', Left err)
+      Right (val, ptr, size) -> do
+        out <- bracket
+          (return (val, ptr, size))
+          (\(_, p, sz) -> mmapFree p sz)
+          (\(v, p, sz) -> action v p sz)
+        return (ustate', Right out)
 
 -- | Check whether the code buffer has room for at least the given
 -- number of bytes.  This should be called by code generators

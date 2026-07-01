@@ -350,6 +350,32 @@ testCodeImageLoadExec = do
     code :: CodeGen () () ()
     code = mov eax (42 :: Word32) >> ret
 
+testCompileExecutableExec :: IO Result
+testCompileExecutableExec = do
+    (_, res) <- compileExecutable code () ()
+    case res of
+      Left err -> failWith $ show err
+      Right ((), exe) -> do
+        let fn = castPtrToFunPtr (executableEntryPtr exe) :: FunPtr (IO Word32)
+        v <- mkCallIO fn
+        freeExecutable exe
+        if v == 42 then pass else failWith $ "expected 42, got " ++ show v
+  where
+    code :: CodeGen () () ()
+    code = mov eax (42 :: Word32) >> ret
+
+testWithCompiledExecutableExec :: IO Result
+testWithCompiledExecutableExec = do
+    (_, res) <- withCompiledExecutable code () () $ \() exe -> do
+      let fn = castPtrToFunPtr (executableEntryPtr exe) :: FunPtr (IO Word32)
+      mkCallIO fn
+    case res of
+      Left err -> failWith $ show err
+      Right v -> if v == 42 then pass else failWith $ "expected 42, got " ++ show v
+  where
+    code :: CodeGen () () ()
+    code = mov eax (42 :: Word32) >> ret
+
 foreign import ccall "dynamic"
   mkCallIO :: FunPtr (IO Word32) -> IO Word32
 
@@ -577,6 +603,8 @@ main = runTests
     -- CodeImage
     , ("codeimage-basic",        testCodeImageBasic)
     , ("codeimage-load-exec",    testCodeImageLoadExec)
+    , ("compile-executable-exec", testCompileExecutableExec)
+    , ("with-compiled-executable-exec", testWithCompiledExecutableExec)
     , ("codeimage-symbols",      testCodeImageSymbols)
     , ("codeimage-golden",       testCodeImageGolden)
     , ("codeimage-small-buffer", testCodeImageSmallBuffer)

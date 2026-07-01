@@ -16,7 +16,13 @@ import Harpy.CodeGenMonad (CodeGen)
 import Harpy.CodeImage
 import Harpy.X86_64
 import Harpy.X86_64.Macro
-import Harpy.X86_64.Call (invoke, invokeI64, unsafeInvoke)
+import Harpy.X86_64.Call
+  ( invoke
+  , invokeI64
+  , unsafeInvoke
+  , unsafeInvokeI64
+  , unsafeInvokeI64_I64
+  )
 
 ------------------------------------------------------------------------
 -- Test harness
@@ -106,6 +112,10 @@ testDiff nasmCode harpyCode = do
 foreign import ccall "dynamic"
   mkCallIO :: FunPtr (IO Word64) -> IO Word64
 
+foreign import ccall "dynamic"
+  mkPtrPtrCallIO :: FunPtr (Ptr Int32 -> Ptr Int32 -> IO Word64)
+                 -> Ptr Int32 -> Ptr Int32 -> IO Word64
+
 execCode :: CodeGen () () () -> IO Word64
 execCode code = do
     (_, res) <- assembleCodeImage code () ()
@@ -120,6 +130,36 @@ testExec _desc code expected = do
     if actual == expected
       then pass
       else failWith $ "expected " ++ show expected ++ " got " ++ show actual
+
+testExecSIMDDotI32x4 :: IO Result
+testExecSIMDDotI32x4 = do
+    withArray ([1, 2, 3, 4] :: [Int32]) $ \as ->
+      withArray ([1, 1, 1, 1] :: [Int32]) $ \bs -> do
+        (_, res) <- assembleCodeImage code () ()
+        case res of
+          Left err -> failWith $ show err
+          Right ((), img) -> withExecutable img $ \exe -> do
+            let fn = castPtrToFunPtr (executableEntryPtr exe)
+            actual <- mkPtrPtrCallIO fn as bs
+            if actual == 10
+              then pass
+              else failWith $ "expected 10 got " ++ show actual
+  where
+    code :: CodeGen () () ()
+    code = do
+      pxorX xmm0 xmm0
+      movdquLoad xmm1 (base rdi)
+      movdquLoad xmm2 (base rsi)
+      pmulld xmm1 xmm2
+      paddd xmm0 xmm1
+      movdquXmm xmm1 xmm0
+      psrldq xmm1 8
+      paddd xmm0 xmm1
+      movdquXmm xmm1 xmm0
+      psrldq xmm1 4
+      paddd xmm0 xmm1
+      movdFromXmm eax xmm0
+      ret
 
 ------------------------------------------------------------------------
 -- Tests
@@ -181,6 +221,24 @@ main = runTests
     , ("g-shl-al-1",   testGolden "shl al,1"
         (shl (op al) (imm 1))
         [0xd0, 0xe0])
+    , ("g-pxor-xmm0-xmm0", testGolden "pxor xmm0,xmm0"
+        (pxorX xmm0 xmm0)
+        [0x66, 0x0f, 0xef, 0xc0])
+    , ("g-movdqu-xmm1-rdi", testGolden "movdqu xmm1,[rdi]"
+        (movdquLoad xmm1 (base rdi))
+        [0xf3, 0x0f, 0x6f, 0x0f])
+    , ("g-pmulld-xmm0-xmm1", testGolden "pmulld xmm0,xmm1"
+        (pmulld xmm0 xmm1)
+        [0x66, 0x0f, 0x38, 0x40, 0xc1])
+    , ("g-paddd-xmm0-xmm1", testGolden "paddd xmm0,xmm1"
+        (paddd xmm0 xmm1)
+        [0x66, 0x0f, 0xfe, 0xc1])
+    , ("g-psrldq-xmm0-8", testGolden "psrldq xmm0,8"
+        (psrldq xmm0 8)
+        [0x66, 0x0f, 0x73, 0xd8, 0x08])
+    , ("g-movd-eax-xmm0", testGolden "movd eax,xmm0"
+        (movdFromXmm eax xmm0)
+        [0x66, 0x0f, 0x7e, 0xc0])
 
     -- INC/DEC (FF /0 /1 form)
     , ("g-inc-rax",     testGolden "inc rax"
@@ -336,6 +394,14 @@ main = runTests
         r <- unsafeInvoke (mov (op rax) (imm 42) >> ret) $ \fp ->
           mkCallIO (castFunPtr fp)
         if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
+    , ("x-unsafeInvokeI64", do
+        r <- unsafeInvokeI64
+          (mov (op rax) (op rdi) >> add (op rax) (imm 1) >> ret) 41
+        if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
+    , ("x-unsafeInvokeI64_I64", do
+        r <- unsafeInvokeI64_I64
+          (mov (op rax) (op rdi) >> add (op rax) (op rsi) >> ret) 20 22
+        if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
 
     -- Verification tests
     , ("v-undef-label", do
@@ -415,6 +481,7 @@ main = runTests
             mov (op rdx) (imm 22)
             lea rax (Mem (Just rcx) (Just (rdx, S1)) 0)
             ret) 42)
+    , ("x-simd-dot-i32x4", testExecSIMDDotI32x4)
     , ("x-retN",        testExec "retN 0 returns normally"
         (mov (op rax) (imm 42) >> retN 0) 42)
     , ("d-inc-eax",     testDiff "inc eax" (inc (op eax)))
