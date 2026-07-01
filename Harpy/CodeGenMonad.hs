@@ -74,9 +74,6 @@ module Harpy.CodeGenMonad(
           emit32At,
           checkBufferSize,
           ensureBufferSize,
-    -- ** Executing code generation
-          runCodeGen,
-          runCodeGenWithConfig,
     -- ** Producing a CodeImage
           assembleCodeImage,
           assembleCodeImageWithConfig,
@@ -161,7 +158,6 @@ data FixupEntry = FixupEntry {
 data FixupKind = Fixup8          -- ^ 8-bit relative reference
                | Fixup16         -- ^ 16-bit relative reference
                | Fixup32         -- ^ 32-bit relative reference
-               | Fixup32Absolute -- ^ 32-bit absolute reference
                deriving (Show)
 
 data CodeGenEnv = CodeGenEnv { tailContext :: Bool }
@@ -261,15 +257,6 @@ defaultCodeBufferSize = 4096
 mappingFromPtr :: Ptr Word8 -> Int -> ExecMem.Mapping
 mappingFromPtr ptr size = ExecMem.Mapping ptr (ExecMem.pageAlign size)
 
--- | Execute code generation, given a user environment and state.  The
--- result is a tuple of the resulting user state and either an error
--- message (when code generation failed) or the result of the code
--- generation.  This function runs 'runCodeGenWithConfig' with a
--- sensible default configuration.
-runCodeGen :: CodeGen e s a -> e -> s -> IO (s, Either ErrMsg a)
-runCodeGen cg uenv ustate =
-    runCodeGenWithConfig cg uenv ustate defaultCodeGenConfig
-
 mmapRW :: Int -> IO (Ptr Word8)
 mmapRW size = ExecMem.mappingPtr <$> ExecMem.allocate size
 
@@ -282,28 +269,6 @@ mprotectRX p size = ExecMem.protect ExecMem.ReadExecute (mappingFromPtr p size)
 mprotectRW :: Ptr Word8 -> Int -> IO ()
 mprotectRW p size = ExecMem.protect ExecMem.ReadWrite (mappingFromPtr p size)
 
--- | Like 'runCodeGen', but allows more control over the code
--- generation process.  In addition to a code generator and a user
--- environment and state, a code generation configuration must be
--- provided.  A code generation configuration allows control over the
--- allocation of code buffers, for example.
-runCodeGenWithConfig :: CodeGen e s a -> e -> s -> CodeGenConfig -> IO (s, Either ErrMsg a)
-runCodeGenWithConfig code uenv ustate conf =
-    do (buf, sze, managed) <- case customCodeBuffer conf of
-                       Nothing -> do let initSize = ExecMem.pageAlign (codeBufferSize conf)
-                                     arr <- mmapRW initSize
-                                     return (arr, initSize, True)
-                       Just (buf, sze) -> return (buf, sze, False)
-       let env = CodeGenEnv {tailContext = True}
-       let state = emptyCodeGenState{buffer = buf,
-                                     firstBuffer = buf,
-                                     bufferSize = sze,
-                                     config = conf}
-       ((ustate', finalState), res) <- runCodeGenInternal code (uenv, env) (ustate, state)
-       -- Finalize: flip buffer to RX so generated code is executable
-       when managed $
-         mprotectRX (firstBuffer finalState) (bufferSize finalState)
-       return (ustate', res)
 
 -- | Run code generation and capture the result as a 'CodeImage'.
 -- The code is emitted into a temporary buffer (not mapped executable).
@@ -597,7 +562,6 @@ performFixup labOfs (FixupEntry{fueOfs = ofs, fueKind = knd}) =
                   Fixup8  -> pokeByteOff buf ofs (fromIntegral diff - 1 :: Word8)
                   Fixup16 -> pokeByteOff buf ofs (fromIntegral diff - 2 :: Word16)
                   Fixup32 -> pokeByteOff buf ofs (fromIntegral diff - 4 :: Word32)
-                  Fixup32Absolute -> pokeByteOff buf ofs (fromIntegral (ptrToWordPtr (buf `plusPtr` labOfs)) :: Word32)
        return ()
 
 

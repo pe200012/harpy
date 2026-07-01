@@ -11,22 +11,15 @@ Category:       Code Generation
 Synopsis:       Runtime code generation for x86 machine code
 Description:    The package contains the following components:
     .
-    * An x86 assembler.  We provide both low-level code generation in
-      module "Harpy.X86CodeGen" as well as a (slightly) higher-level
-      implementation in module "Harpy.X86Assembler", which figures out
-      addressing modes based on an instruction's operand types.
+    * A width-indexed x86-64 assembler with compile-time operand-size
+      checking in module "Harpy.X86_64", with SysV64 ABI helpers
+      ("Harpy.X86_64.Macro") and typed invocation ("Harpy.X86_64.Call").
     .
-    * An x86 disassembler which knows most of the opcodes available on
-      modern x86 processors and can display its output both in the style
-      used in Intel documents an in AT&T style, like the GNU tools. The
-      disassembler can be found in module "Harpy.X86Disassembler".  The
-          disassembler is re-exported from the disassembler package for
-          compatibility with earlier Harpy releases.
+    * A W^X JIT pipeline: assemble into a pure "Harpy.CodeImage", then load
+      it into executable memory ("Harpy.CodeImage").
     .
-    * Some abstractions over the abovementioned code generation modules,
-      such as automatic label management and code generation
-      combinators (for if-then-else statements, while-loops, functions)
-      (module "Harpy.X86CGCombinators").
+    * An x86 disassembler in module "Harpy.X86Disassembler", re-exported
+      from the disassembler package.
     .
     * All the above modules use the code generation monad defined in module
       "Harpy.CodeGenMonad".
@@ -36,9 +29,6 @@ Stability:      Experimental
 
 Extra-source-files:
     NEWS README.md Makefile ChangeLog.md
-    doc/Makefile doc/tutorial.lhs doc/larger-tutorial.lhs
-    examples/evaluator/ArithTypes.hs examples/evaluator/ArithParser.hs
-    examples/evaluator/Evaluator.hs
 
 source-repository head
   type:     git
@@ -57,19 +47,14 @@ Library
     disassembler >= 0.2.0.0 && < 0.3,
     unix >= 2.7 && < 2.9
   Exposed-Modules:
-    Harpy,
     Harpy.X86_64,
     Harpy.X86_64.Encoding,
     Harpy.X86_64.Macro,
     Harpy.X86_64.Call,
     Harpy.Internal.ExecutableMemory,
-    Harpy.X86CodeGen,
-    Harpy.X86Assembler,
     Harpy.CodeGenMonad,
     Harpy.CodeImage,
-    Harpy.Call,
-    Harpy.X86Disassembler,
-    Harpy.X86CGCombinators
+    Harpy.X86Disassembler
   default-language: Haskell2010
   Default-Extensions:
     ForeignFunctionInterface, MultiParamTypeClasses,
@@ -103,23 +88,6 @@ executable harpy-bench
     ForeignFunctionInterface, DataKinds, ScopedTypeVariables,
     TypeApplications, BangPatterns
   ghc-options: -Wall -O2 -rtsopts
-
-test-suite harpy-tests
-  type:           exitcode-stdio-1.0
-  hs-source-dirs: test
-  main-is:        Main.hs
-  build-depends:
-    base >= 4 && < 5,
-    bytestring,
-    process,
-    tasty >= 1.5 && < 1.6,
-    tasty-hunit >= 0.10 && < 0.11,
-    temporary >= 1.3 && < 1.4,
-    harpy
-  default-language: Haskell2010
-  Default-Extensions:
-    ForeignFunctionInterface, TemplateHaskell, CPP
-  ghc-options: -Wall
 
 test-suite harpy-x86-64-tests
   type:           exitcode-stdio-1.0
