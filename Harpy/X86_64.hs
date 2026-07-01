@@ -1,0 +1,716 @@
+{-# LANGUAGE DataKinds, GADTs, KindSignatures, ScopedTypeVariables,
+             TypeApplications, RankNTypes, MultiParamTypeClasses,
+             FlexibleInstances, FlexibleContexts, StandaloneDeriving #-}
+--------------------------------------------------------------------------
+-- |
+-- Module:      Harpy.X86_64
+-- License:     BSD3
+--
+-- Width-indexed x86-64 assembler with compile-time operand-size checking.
+-- Replaces the old Harpy.X86Assembler / Harpy.X86CodeGen modules.
+--------------------------------------------------------------------------
+
+module Harpy.X86_64 (
+    -- * Width and register types
+      Width(..), SWidth(..), IsWidth(..)
+    , Reg(..)
+    -- * Named registers (64-bit)
+    , rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi
+    , r8, r9, r10, r11, r12, r13, r14, r15
+    -- * Named registers (32-bit)
+    , eax, ecx, edx, ebx, esp, ebp, esi, edi
+    , r8d, r9d, r10d, r11d, r12d, r13d, r14d, r15d
+    -- * Named registers (16-bit)
+    , ax, cx, dx, bx, sp, bp, si, di
+    -- * Named registers (8-bit)
+    , al, cl, dl, bl
+    -- * Memory operands
+    , Mem(..), addr, base, index, disp
+    -- * Operand type
+    , Operand(..), op, mem, imm
+    -- * Scale
+    , Scale(..)
+    -- * Instructions
+    , mov, add, sub, xor, and, or, cmp, test
+    , lea
+    , push, pop
+    , ret, retN
+    , call, jmp
+    , jcc, Cond(..)
+    , je, jne, jl, jge, jle, jg, jb, jae, jbe, ja, jo, jno, js, jns
+    , nop
+    , inc, dec, neg, not
+    , imul, idiv
+    , shl, shr, sar
+    , cdq, cqo
+    , syscall
+    , breakpoint
+    -- * Labels
+    , Label, newLabel, newNamedLabel, setLabel, defineLabel, (@@)
+    ) where
+
+import Prelude hiding (and, or, not)
+import qualified Prelude
+import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
+import Data.Int
+import Data.Word
+import Foreign.Ptr (Ptr)
+
+import Harpy.CodeGenMonad
+    ( CodeGen, Label
+    , emit8, emit32, emit32At
+    , ensureBufferSize, getCodeOffset, getBasePtr
+    , newLabel, newNamedLabel, setLabel, defineLabel, (@@)
+    , emitFixup, FixupKind(..)
+    )
+
+------------------------------------------------------------------------
+-- Width
+------------------------------------------------------------------------
+
+data Width = W8 | W16 | W32 | W64
+
+data SWidth (w :: Width) where
+  SW8  :: SWidth 'W8
+  SW16 :: SWidth 'W16
+  SW32 :: SWidth 'W32
+  SW64 :: SWidth 'W64
+
+deriving instance Show (SWidth w)
+
+class IsWidth (w :: Width) where
+  swidth :: SWidth w
+
+instance IsWidth 'W8  where swidth = SW8
+instance IsWidth 'W16 where swidth = SW16
+instance IsWidth 'W32 where swidth = SW32
+instance IsWidth 'W64 where swidth = SW64
+
+------------------------------------------------------------------------
+-- Registers
+------------------------------------------------------------------------
+
+data Reg (w :: Width) where
+  Reg :: Word8 -> Reg w
+
+deriving instance Show (Reg w)
+deriving instance Eq (Reg w)
+
+regCode :: Reg w -> Word8
+regCode (Reg c) = c .&. 0x07
+
+regExt :: Reg w -> Bool
+regExt (Reg c) = testBit c 3
+
+-- 64-bit
+rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi :: Reg 'W64
+r8, r9, r10, r11, r12, r13, r14, r15   :: Reg 'W64
+rax = Reg 0;  rcx = Reg 1;  rdx = Reg 2;  rbx = Reg 3
+rsp = Reg 4;  rbp = Reg 5;  rsi = Reg 6;  rdi = Reg 7
+r8  = Reg 8;  r9  = Reg 9;  r10 = Reg 10; r11 = Reg 11
+r12 = Reg 12; r13 = Reg 13; r14 = Reg 14; r15 = Reg 15
+
+-- 32-bit
+eax, ecx, edx, ebx, esp, ebp, esi, edi :: Reg 'W32
+r8d, r9d, r10d, r11d, r12d, r13d, r14d, r15d :: Reg 'W32
+eax = Reg 0; ecx = Reg 1; edx = Reg 2; ebx = Reg 3
+esp = Reg 4; ebp = Reg 5; esi = Reg 6; edi = Reg 7
+r8d = Reg 8; r9d = Reg 9; r10d = Reg 10; r11d = Reg 11
+r12d = Reg 12; r13d = Reg 13; r14d = Reg 14; r15d = Reg 15
+
+-- 16-bit
+ax, cx, dx, bx, sp, bp, si, di :: Reg 'W16
+ax = Reg 0; cx = Reg 1; dx = Reg 2; bx = Reg 3
+sp = Reg 4; bp = Reg 5; si = Reg 6; di = Reg 7
+
+-- 8-bit (low only; no AH/BH/CH/DH)
+al, cl, dl, bl :: Reg 'W8
+al = Reg 0; cl = Reg 1; dl = Reg 2; bl = Reg 3
+
+------------------------------------------------------------------------
+-- Memory operands
+------------------------------------------------------------------------
+
+data Scale = S1 | S2 | S4 | S8 deriving (Show, Eq)
+
+scaleVal :: Scale -> Word8
+scaleVal S1 = 0; scaleVal S2 = 1; scaleVal S4 = 2; scaleVal S8 = 3
+
+data Mem (w :: Width) = Mem
+  { memBase  :: Maybe (Reg 'W64)
+  , memIndex :: Maybe (Reg 'W64, Scale)
+  , memDisp  :: Int32
+  }
+
+addr :: Int32 -> Mem w
+addr d = Mem Nothing Nothing d
+
+base :: Reg 'W64 -> Mem w
+base r = Mem (Just r) Nothing 0
+
+index :: Reg 'W64 -> Scale -> Int32 -> Mem w
+index r s d = Mem Nothing (Just (r, s)) d
+
+disp :: Reg 'W64 -> Int32 -> Mem w
+disp r d = Mem (Just r) Nothing d
+
+------------------------------------------------------------------------
+-- Operands
+------------------------------------------------------------------------
+
+data Operand (w :: Width) where
+  RegOp :: Reg w -> Operand w
+  MemOp :: Mem w -> Operand w
+  ImmOp :: Int64 -> Operand w
+
+deriving instance Show (Operand w)
+
+op :: Reg w -> Operand w
+op = RegOp
+
+mem :: Mem w -> Operand w
+mem = MemOp
+
+imm :: Int64 -> Operand w
+imm = ImmOp
+
+instance Show (Mem w) where
+  show (Mem b i d) =
+    let bs = maybe "" (\(Reg c) -> "r" ++ Prelude.show c) b
+        is = maybe "" (\(Reg c, s) -> "r" ++ Prelude.show c ++ "*" ++ Prelude.show (1 `shiftL` fromIntegral (scaleVal s) :: Int)) i
+        ds = if d == 0 && (b /= Nothing || i /= Nothing) then "" else Prelude.show d
+    in "[" ++ bs ++ (if bs /= "" && is /= "" then "+" else "") ++ is
+           ++ (if (bs /= "" || is /= "") && ds /= "" then "+" else "") ++ ds ++ "]"
+
+------------------------------------------------------------------------
+-- Encoding helpers
+------------------------------------------------------------------------
+
+maxInsnBytes :: Int
+maxInsnBytes = 15
+
+-- REX prefix byte construction
+emitRex :: Word8 -> CodeGen e s ()
+emitRex bits = emit8 (0x40 .|. bits)
+
+rexW, rexR, rexX, rexB :: Word8
+rexW = 0x08; rexR = 0x04; rexX = 0x02; rexB = 0x01
+
+needsRex :: IsWidth w => SWidth w -> Bool
+needsRex SW64 = True
+needsRex _    = False
+
+-- Emit REX for register-only instruction (reg in ModRM.reg, rm in ModRM.rm)
+emitRexRR :: forall w e s. IsWidth w => Reg w -> Reg w -> CodeGen e s ()
+emitRexRR reg rm = do
+  let bits = (if needsRex (swidth @w) then rexW else 0)
+         .|. (if regExt reg then rexR else 0)
+         .|. (if regExt rm  then rexB else 0)
+  case swidth @w of
+    SW16 -> emit8 0x66
+    _    -> return ()
+  if bits /= 0 then emitRex bits else return ()
+
+-- REX for reg + memory operand
+emitRexRM :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()
+emitRexRM reg m = do
+  let bBit = case memBase m of
+               Just r | regExt r -> rexB
+               _ -> 0
+      xBit = case memIndex m of
+               Just (r, _) | regExt r -> rexX
+               _ -> 0
+      bits = (if needsRex (swidth @w) then rexW else 0)
+         .|. (if regExt reg then rexR else 0)
+         .|. xBit .|. bBit
+  case swidth @w of
+    SW16 -> emit8 0x66
+    _    -> return ()
+  if bits /= 0 then emitRex bits else return ()
+
+-- REX for single register in ModRM.rm (e.g. INC, DEC, NOT, NEG, PUSH, etc.)
+emitRexR :: forall w e s. IsWidth w => Reg w -> CodeGen e s ()
+emitRexR rm = do
+  let bits = (if needsRex (swidth @w) then rexW else 0)
+         .|. (if regExt rm then rexB else 0)
+  case swidth @w of
+    SW16 -> emit8 0x66
+    _    -> return ()
+  if bits /= 0 then emitRex bits else return ()
+
+-- REX for single register in opcode +rd (e.g. PUSH 50+rd, POP 58+rd, MOV B8+rd)
+emitRexOp :: forall w e s. IsWidth w => Reg w -> CodeGen e s ()
+emitRexOp = emitRexR @w
+
+-- ModRM byte: mod(2) reg(3) rm(3)
+modRM :: Word8 -> Word8 -> Word8 -> Word8
+modRM m r rm = (m `shiftL` 6) .|. ((r .&. 7) `shiftL` 3) .|. (rm .&. 7)
+
+-- Emit ModRM for two registers (mod=11)
+emitModRMrr :: Reg w -> Reg w -> CodeGen e s ()
+emitModRMrr reg rm = emit8 (modRM 3 (regCode reg) (regCode rm))
+
+-- Emit ModRM + optional SIB + displacement for a memory operand
+emitModRMmem :: Word8 -> Mem w -> CodeGen e s ()
+emitModRMmem regBits m = case (memBase m, memIndex m, memDisp m) of
+  -- [disp32] (no base, no index) — use SIB form: mod=00, rm=100(SIB), base=101(none), index=100(none)
+  (Nothing, Nothing, d) -> do
+    emit8 (modRM 0 regBits 4)
+    emit8 (modRM 0 4 5)  -- SIB: scale=0, index=RSP(none), base=RBP(disp32)
+    emit32 (fromIntegral d)
+
+  -- [base + disp]
+  (Just br, Nothing, d) -> do
+    let bc = regCode br
+    if bc == 4 -- RSP/R12 needs SIB
+      then do
+        let md = modBits d (bc == 5)
+        emit8 (modRM md regBits 4) -- rm=100 => SIB
+        emit8 (modRM 0 4 bc)       -- SIB: scale=0, index=RSP(none), base=br
+        emitDisp md d
+      else if bc == 5 && d == 0 -- RBP/R13 with 0 disp needs mod=01 + 0x00
+        then do
+          emit8 (modRM 1 regBits bc)
+          emit8 0
+        else do
+          let md = modBits d False
+          emit8 (modRM md regBits bc)
+          emitDisp md d
+
+  -- [index*scale + disp32]
+  (Nothing, Just (ir, sc), d) -> do
+    emit8 (modRM 0 regBits 4) -- rm=100 => SIB
+    emit8 (modRM (scaleVal sc) (regCode ir) 5) -- base=101(none)
+    emit32 (fromIntegral d)
+
+  -- [base + index*scale + disp]
+  (Just br, Just (ir, sc), d) -> do
+    let bc = regCode br
+        md = modBits d (bc == 5)
+    emit8 (modRM md regBits 4)
+    emit8 (modRM (scaleVal sc) (regCode ir) bc)
+    emitDisp md d
+  where
+    modBits :: Int32 -> Bool -> Word8
+    modBits d forceDisp
+      | d == 0 && Prelude.not forceDisp = 0
+      | isImm8 d                        = 1
+      | otherwise                       = 2
+    emitDisp :: Word8 -> Int32 -> CodeGen e s ()
+    emitDisp 0 _ = return ()
+    emitDisp 1 d = emit8 (fromIntegral d)
+    emitDisp _ d = emit32 (fromIntegral d)
+
+isImm8 :: Int32 -> Bool
+isImm8 n = n >= -128 && n <= 127
+
+isImm8' :: Int64 -> Bool
+isImm8' n = n >= -128 && n <= 127
+
+isImm32' :: Int64 -> Bool
+isImm32' n = n >= fromIntegral (minBound :: Int32) && n <= fromIntegral (maxBound :: Int32)
+
+------------------------------------------------------------------------
+-- ALU instructions (add, sub, xor, and, or, cmp)
+------------------------------------------------------------------------
+
+-- ALU group index: ADD=0 OR=1 ADC=2 SBB=3 AND=4 SUB=5 XOR=6 CMP=7
+type AluOp = Word8
+
+emitAlu :: forall w e s. IsWidth w => AluOp -> Operand w -> Operand w -> CodeGen e s ()
+emitAlu grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+  -- reg, reg
+  (RegOp rd, RegOp rs) -> do
+    emitRexRR @w rs rd
+    emit8 (grp `shiftL` 3 .|. 1)  -- ALU r/m, reg
+    emitModRMrr rs rd
+
+  -- reg, imm
+  (RegOp rd, ImmOp i)
+    -- EAX/RAX shortcut
+    | regCode rd == 0 && Prelude.not (regExt rd) && Prelude.not (isImm8' i) -> do
+        emitRexR @w rd
+        emit8 (grp `shiftL` 3 .|. 5)
+        emit32 (fromIntegral i)
+    -- imm8 sign-extended
+    | isImm8' i -> do
+        emitRexR @w rd
+        emit8 0x83
+        emit8 (modRM 3 grp (regCode rd))
+        emit8 (fromIntegral i)
+    -- imm32
+    | otherwise -> do
+        emitRexR @w rd
+        emit8 0x81
+        emit8 (modRM 3 grp (regCode rd))
+        emit32 (fromIntegral i)
+
+  -- reg, [mem]
+  (RegOp rd, MemOp m) -> do
+    emitRexRM @w rd m
+    emit8 (grp `shiftL` 3 .|. 3) -- ALU reg, r/m
+    emitModRMmem (regCode rd) m
+
+  -- [mem], reg
+  (MemOp m, RegOp rs) -> do
+    emitRexRM @w rs m
+    emit8 (grp `shiftL` 3 .|. 1) -- ALU r/m, reg
+    emitModRMmem (regCode rs) m
+
+  -- [mem], imm
+  (MemOp m, ImmOp i)
+    | isImm8' i -> do
+        emitRexRM @w (Reg @w 0) m
+        emit8 0x83
+        emitModRMmem grp m
+        emit8 (fromIntegral i)
+    | otherwise -> do
+        emitRexRM @w (Reg @w 0) m
+        emit8 0x81
+        emitModRMmem grp m
+        emit32 (fromIntegral i)
+
+  _ -> error "invalid ALU operand combination"
+
+add :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+add = emitAlu 0
+
+or :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+or = emitAlu 1
+
+and :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+and = emitAlu 4
+
+sub :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+sub = emitAlu 5
+
+xor :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+xor = emitAlu 6
+
+cmp :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+cmp = emitAlu 7
+
+------------------------------------------------------------------------
+-- TEST
+------------------------------------------------------------------------
+
+test :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+  (RegOp rd, RegOp rs) -> do
+    emitRexRR @w rs rd
+    emit8 0x85
+    emitModRMrr rs rd
+  (RegOp rd, ImmOp i)
+    | regCode rd == 0 && Prelude.not (regExt rd) -> do
+        emitRexR @w rd
+        emit8 0xA9
+        emit32 (fromIntegral i)
+    | otherwise -> do
+        emitRexR @w rd
+        emit8 0xF7
+        emit8 (modRM 3 0 (regCode rd))
+        emit32 (fromIntegral i)
+  (MemOp m, RegOp rs) -> do
+    emitRexRM @w rs m
+    emit8 0x85
+    emitModRMmem (regCode rs) m
+  _ -> error "invalid TEST operand combination"
+
+------------------------------------------------------------------------
+-- MOV
+------------------------------------------------------------------------
+
+mov :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+  -- reg, reg
+  (RegOp rd, RegOp rs) -> do
+    emitRexRR @w rs rd
+    emit8 0x89
+    emitModRMrr rs rd
+
+  -- reg, imm
+  (RegOp rd, ImmOp i) -> case swidth @w of
+    SW64
+      | isImm32' i -> do
+          emitRexR @w rd
+          emit8 0xC7
+          emit8 (modRM 3 0 (regCode rd))
+          emit32 (fromIntegral i)
+      | otherwise -> do
+          emitRexOp @w rd
+          emit8 (0xB8 + regCode rd)
+          emit32 (fromIntegral i)
+          emit32 (fromIntegral (i `shiftR` 32))
+    SW32 -> do
+      emitRexOp @w rd
+      emit8 (0xB8 + regCode rd)
+      emit32 (fromIntegral i)
+    SW16 -> do
+      emitRexOp @w rd
+      emit8 (0xB8 + regCode rd)
+      emit8 (fromIntegral i)
+      emit8 (fromIntegral (i `shiftR` 8))
+    SW8 -> do
+      emitRexOp @w rd
+      emit8 (0xB0 + regCode rd)
+      emit8 (fromIntegral i)
+
+  -- reg, [mem]
+  (RegOp rd, MemOp m) -> do
+    emitRexRM @w rd m
+    emit8 0x8B
+    emitModRMmem (regCode rd) m
+
+  -- [mem], reg
+  (MemOp m, RegOp rs) -> do
+    emitRexRM @w rs m
+    emit8 0x89
+    emitModRMmem (regCode rs) m
+
+  -- [mem], imm
+  (MemOp m, ImmOp i) -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xC7
+    emitModRMmem 0 m
+    emit32 (fromIntegral i)
+
+  _ -> error "invalid MOV operand combination"
+
+------------------------------------------------------------------------
+-- LEA
+------------------------------------------------------------------------
+
+lea :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()
+lea rd m = do
+  ensureBufferSize maxInsnBytes
+  emitRexRM @w rd m
+  emit8 0x8D
+  emitModRMmem (regCode rd) m
+
+------------------------------------------------------------------------
+-- PUSH / POP (always 64-bit in long mode)
+------------------------------------------------------------------------
+
+push :: Reg 'W64 -> CodeGen e s ()
+push r = do
+  ensureBufferSize maxInsnBytes
+  if regExt r then emitRex rexB else return ()
+  emit8 (0x50 + regCode r)
+
+pop :: Reg 'W64 -> CodeGen e s ()
+pop r = do
+  ensureBufferSize maxInsnBytes
+  if regExt r then emitRex rexB else return ()
+  emit8 (0x58 + regCode r)
+
+------------------------------------------------------------------------
+-- RET
+------------------------------------------------------------------------
+
+ret :: CodeGen e s ()
+ret = ensureBufferSize 1 >> emit8 0xC3
+
+retN :: Word16 -> CodeGen e s ()
+retN n = do
+  ensureBufferSize 3
+  emit8 0xC2
+  emit8 (fromIntegral n)
+  emit8 (fromIntegral (n `shiftR` 8))
+
+------------------------------------------------------------------------
+-- CALL / JMP (indirect via register)
+------------------------------------------------------------------------
+
+call :: Reg 'W64 -> CodeGen e s ()
+call r = do
+  ensureBufferSize maxInsnBytes
+  if regExt r then emitRex rexB else return ()
+  emit8 0xFF
+  emit8 (modRM 3 2 (regCode r))
+
+jmp :: Reg 'W64 -> CodeGen e s ()
+jmp r = do
+  ensureBufferSize maxInsnBytes
+  if regExt r then emitRex rexB else return ()
+  emit8 0xFF
+  emit8 (modRM 3 4 (regCode r))
+
+------------------------------------------------------------------------
+-- Conditional jumps
+------------------------------------------------------------------------
+
+data Cond
+  = O | NO | B | AE | E | NE | BE | A
+  | S | NS | P | NP | L | GE | LE | G
+  deriving (Show, Eq)
+
+condCode :: Cond -> Word8
+condCode O  = 0x0; condCode NO = 0x1; condCode B  = 0x2; condCode AE = 0x3
+condCode E  = 0x4; condCode NE = 0x5; condCode BE = 0x6; condCode A  = 0x7
+condCode S  = 0x8; condCode NS = 0x9; condCode P  = 0xA; condCode NP = 0xB
+condCode L  = 0xC; condCode GE = 0xD; condCode LE = 0xE; condCode G  = 0xF
+
+-- | Conditional jump to a label. Emits Jcc rel32 (6 bytes).
+jcc :: Cond -> Label -> CodeGen e s ()
+jcc cc lbl = do
+  ensureBufferSize 6
+  emit8 0x0F
+  emit8 (0x80 + condCode cc)
+  emitFixup lbl 0 Fixup32
+  emit32 0  -- placeholder
+
+je, jne, jl, jge, jle, jg, jb, jae, jbe, ja :: Label -> CodeGen e s ()
+jo, jno, js, jns :: Label -> CodeGen e s ()
+je  = jcc E;  jne = jcc NE; jl  = jcc L;  jge = jcc GE
+jle = jcc LE; jg  = jcc G;  jb  = jcc B;  jae = jcc AE
+jbe = jcc BE; ja  = jcc A;  jo  = jcc O;  jno = jcc NO
+js  = jcc S;  jns = jcc NS
+
+------------------------------------------------------------------------
+-- NOP
+------------------------------------------------------------------------
+
+nop :: CodeGen e s ()
+nop = ensureBufferSize 1 >> emit8 0x90
+
+------------------------------------------------------------------------
+-- INC / DEC (FF /0 and FF /1 form)
+------------------------------------------------------------------------
+
+inc :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
+inc o = ensureBufferSize maxInsnBytes >> case o of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 0xFF
+    emit8 (modRM 3 0 (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xFF
+    emitModRMmem 0 m
+  _ -> error "invalid INC operand"
+
+dec :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
+dec o = ensureBufferSize maxInsnBytes >> case o of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 0xFF
+    emit8 (modRM 3 1 (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xFF
+    emitModRMmem 1 m
+  _ -> error "invalid DEC operand"
+
+------------------------------------------------------------------------
+-- NEG / NOT (F7 /3 and F7 /2)
+------------------------------------------------------------------------
+
+neg :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
+neg o = ensureBufferSize maxInsnBytes >> case o of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 0xF7
+    emit8 (modRM 3 3 (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xF7
+    emitModRMmem 3 m
+  _ -> error "invalid NEG operand"
+
+not :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
+not o = ensureBufferSize maxInsnBytes >> case o of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 0xF7
+    emit8 (modRM 3 2 (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xF7
+    emitModRMmem 2 m
+  _ -> error "invalid NOT operand"
+
+------------------------------------------------------------------------
+-- IMUL (two-operand: 0F AF /r) / IDIV (F7 /7)
+------------------------------------------------------------------------
+
+-- | IMUL dst, src — two-operand form, dst = dst * src
+imul :: forall w e s. IsWidth w => Reg w -> Operand w -> CodeGen e s ()
+imul rd src = ensureBufferSize maxInsnBytes >> case src of
+  RegOp rs -> do
+    emitRexRR @w rd rs
+    emit8 0x0F
+    emit8 0xAF
+    emitModRMrr rd rs
+  MemOp m -> do
+    emitRexRM @w rd m
+    emit8 0x0F
+    emit8 0xAF
+    emitModRMmem (regCode rd) m
+  _ -> error "invalid IMUL operand"
+
+-- | IDIV src — RDX:RAX / src, quotient in RAX, remainder in RDX
+idiv :: forall w e s. IsWidth w => Operand w -> CodeGen e s ()
+idiv src = ensureBufferSize maxInsnBytes >> case src of
+  RegOp r -> do
+    emitRexR @w r
+    emit8 0xF7
+    emit8 (modRM 3 7 (regCode r))
+  MemOp m -> do
+    emitRexRM @w (Reg @w 0) m
+    emit8 0xF7
+    emitModRMmem 7 m
+  _ -> error "invalid IDIV operand"
+
+------------------------------------------------------------------------
+-- Shifts: SHL(4) SHR(5) SAR(7)
+------------------------------------------------------------------------
+
+emitShift :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> CodeGen e s ()
+emitShift grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
+  -- reg, imm8
+  (RegOp rd, ImmOp 1) -> do
+    emitRexR @w rd
+    emit8 0xD1
+    emit8 (modRM 3 grp (regCode rd))
+  (RegOp rd, ImmOp i) -> do
+    emitRexR @w rd
+    emit8 0xC1
+    emit8 (modRM 3 grp (regCode rd))
+    emit8 (fromIntegral i)
+  -- reg, CL (CL = Reg 1 W8)
+  (RegOp rd, RegOp (Reg 1)) -> do
+    emitRexR @w rd
+    emit8 0xD3
+    emit8 (modRM 3 grp (regCode rd))
+  _ -> error "invalid shift operand combination"
+
+shl :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+shl = emitShift 4
+
+shr :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+shr = emitShift 5
+
+sar :: IsWidth w => Operand w -> Operand w -> CodeGen e s ()
+sar = emitShift 7
+
+------------------------------------------------------------------------
+-- CDQ / CQO
+------------------------------------------------------------------------
+
+-- | CDQ: sign-extend EAX into EDX:EAX
+cdq :: CodeGen e s ()
+cdq = ensureBufferSize 1 >> emit8 0x99
+
+-- | CQO: sign-extend RAX into RDX:RAX
+cqo :: CodeGen e s ()
+cqo = ensureBufferSize 2 >> emitRex rexW >> emit8 0x99
+
+------------------------------------------------------------------------
+-- SYSCALL / INT3
+------------------------------------------------------------------------
+
+syscall :: CodeGen e s ()
+syscall = ensureBufferSize 2 >> emit8 0x0F >> emit8 0x05
+
+breakpoint :: CodeGen e s ()
+breakpoint = ensureBufferSize 1 >> emit8 0xCC
