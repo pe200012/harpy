@@ -376,16 +376,24 @@ assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
        case res of
          Left err -> do free buf; return (ustate', Left err)
          Right val -> do
-           let len = bufferOfs finalState
-           bytes <- BS.packCStringLen (castPtr (buffer finalState), len)
-           let syms = [ CISymbol name ofs
-                       | (_, (_, ofs, name)) <- Map.toList (definedLabels finalState)
-                       , not (null name) ]
-               img = CodeImage
-                       { codeImageSections = [Section TextSection bytes]
-                       , codeImageSymbols  = syms }
-           free (buffer finalState)
-           return (ustate', Right (val, img))
+           let pending = pendingFixups finalState
+           if Prelude.not (Map.null pending)
+             then do
+               let undefs = Map.keys pending
+                   msg = "undefined labels: " ++ show undefs
+               free (buffer finalState)
+               return (ustate', Left (text msg))
+             else do
+               let len = bufferOfs finalState
+               bytes <- BS.packCStringLen (castPtr (buffer finalState), len)
+               let syms = [ CISymbol name ofs
+                           | (_, (_, ofs, name)) <- Map.toList (definedLabels finalState)
+                           , Prelude.not (null name) ]
+                   img = CodeImage
+                           { codeImageSections = [Section TextSection bytes]
+                           , codeImageSymbols  = syms }
+               free (buffer finalState)
+               return (ustate', Right (val, img))
 
 -- | Check whether the code buffer has room for at least the given
 -- number of bytes.  This should be called by code generators

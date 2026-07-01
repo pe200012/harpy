@@ -318,4 +318,11 @@ main = runTests
     , ("x-invokeI64",   do
         r <- invokeI64 (mov (op rax) (op rdi) >> add (op rax) (imm 1) >> ret) 41
         if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
+
+    -- Verification tests
+    , ("v-undef-label", do
+        r <- emitBytes (do lbl <- newLabel; je lbl; ret)
+        case r of
+          Left _  -> pass
+          Right _ -> failWith "expected failure for undefined label")
     ]
