@@ -58,6 +58,7 @@ Library
   Exposed-Modules:
     Harpy,
     Harpy.X86_64,
+    Harpy.X86_64.Macro,
     Harpy.X86CodeGen,
     Harpy.X86Assembler,
     Harpy.CodeGenMonad,

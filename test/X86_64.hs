@@ -19,6 +19,7 @@ import Harpy.CodeGenMonad
     )
 import Harpy.CodeImage
 import Harpy.X86_64
+import Harpy.X86_64.Macro
 
 ------------------------------------------------------------------------
 -- Test harness
@@ -291,4 +292,21 @@ main = runTests
             defineLabel lbl
             jmpLabel lbl)
         [0xeb, 0xfe])  -- jmp -2 (jump to self)
+
+    -- Macro tests (SysV64 ABI)
+    , ("x-withFrame",   testExec "withFrame returns 42"
+        (withFrame 0 $ mov (op rax) (imm 42)) 42)
+    , ("x-callee-save", testExec "callee-saved regs preserved across frame"
+        (do pushAll [rbx, r12]
+            mov (op rbx) (imm 11)
+            mov (op r12) (imm 31)
+            mov (op rax) (op rbx)
+            add (op rax) (op r12)
+            popAll [rbx, r12]
+            ret) 42)
+    , ("x-frame-stack", testExec "prologue allocates stack space"
+        (withFrame 32 $ do
+            -- store 42 at [rbp-8], load it back
+            mov (mem (disp rbp (-8))) (imm 42 :: Operand 'W64)
+            mov (op rax) (mem (disp rbp (-8)))) 42)
     ]
