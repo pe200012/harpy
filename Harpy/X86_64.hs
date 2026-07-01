@@ -310,6 +310,47 @@ emitModRMmem regBits m = case (memBase m, memIndex m, memDisp m) of
     emitDisp 1 d = emit8 (fromIntegral d)
     emitDisp _ d = emit32 (fromIntegral d)
 
+emit16 :: Word16 -> CodeGen e s ()
+emit16 n = do
+  emit8 (fromIntegral n)
+  emit8 (fromIntegral (n `shiftR` 8))
+
+emitImmWidth :: SWidth w -> Int64 -> CodeGen e s ()
+emitImmWidth SW8  i = emit8 (fromIntegral i)
+emitImmWidth SW16 i = emit16 (fromIntegral i)
+emitImmWidth _    i = emit32 (fromIntegral i)
+
+isW8 :: SWidth w -> Bool
+isW8 SW8 = True
+isW8 _   = False
+
+aluRmRegOpcode :: SWidth w -> Word8 -> Word8
+aluRmRegOpcode w grp = (grp `shiftL` 3) .|. if isW8 w then 0 else 1
+
+aluRegRmOpcode :: SWidth w -> Word8 -> Word8
+aluRegRmOpcode w grp = (grp `shiftL` 3) .|. if isW8 w then 2 else 3
+
+aluAccImmOpcode :: SWidth w -> Word8 -> Word8
+aluAccImmOpcode w grp = (grp `shiftL` 3) .|. if isW8 w then 4 else 5
+
+aluImmOpcode :: SWidth w -> Int64 -> Word8
+aluImmOpcode SW8  _ = 0x80
+aluImmOpcode _    i = if isImm8' i then 0x83 else 0x81
+
+emitAluImmediate :: SWidth w -> Int64 -> CodeGen e s ()
+emitAluImmediate SW8  i = emit8 (fromIntegral i)
+emitAluImmediate SW16 i
+  | isImm8' i  = emit8 (fromIntegral i)
+  | otherwise = emit16 (fromIntegral i)
+emitAluImmediate _ i
+  | isImm8' i  = emit8 (fromIntegral i)
+  | otherwise = emit32 (fromIntegral i)
+
+unaryOpcode :: SWidth w -> Word8 -> Word8
+unaryOpcode SW8 0xFF = 0xFE
+unaryOpcode SW8 0xF7 = 0xF6
+unaryOpcode _   opc  = opc
+
 isImm8 :: Int32 -> Bool
 isImm8 n = n >= -128 && n <= 127
 
@@ -361,42 +402,36 @@ emitFormALU :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> Cod
 emitFormALU grp dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
-    emit8 (grp `shiftL` 3 .|. 1)
+    emit8 (aluRmRegOpcode (swidth @w) grp)
     emitModRMrr rs rd
   (RegOp rd, ImmOp i)
+    | isW8 (swidth @w) && regCode rd == 0 && Prelude.not (regExt rd) -> do
+        emitRexR @w rd
+        emit8 (aluAccImmOpcode (swidth @w) grp)
+        emit8 (fromIntegral i)
     | regCode rd == 0 && Prelude.not (regExt rd) && Prelude.not (isImm8' i) -> do
         emitRexR @w rd
-        emit8 (grp `shiftL` 3 .|. 5)
-        emit32 (fromIntegral i)
-    | isImm8' i -> do
-        emitRexR @w rd
-        emit8 0x83
-        emit8 (modRM 3 grp (regCode rd))
-        emit8 (fromIntegral i)
+        emit8 (aluAccImmOpcode (swidth @w) grp)
+        emitImmWidth (swidth @w) i
     | otherwise -> do
         emitRexR @w rd
-        emit8 0x81
+        emit8 (aluImmOpcode (swidth @w) i)
         emit8 (modRM 3 grp (regCode rd))
-        emit32 (fromIntegral i)
+        emitAluImmediate (swidth @w) i
   (RegOp rd, MemOp m) -> do
     emitRexRM @w rd m
-    emit8 (grp `shiftL` 3 .|. 3)
+    emit8 (aluRegRmOpcode (swidth @w) grp)
     emitModRMmem (regCode rd) m
   (MemOp m, RegOp rs) -> do
     emitRexRM @w rs m
-    emit8 (grp `shiftL` 3 .|. 1)
+    emit8 (aluRmRegOpcode (swidth @w) grp)
     emitModRMmem (regCode rs) m
   (MemOp m, ImmOp i)
-    | isImm8' i -> do
-        emitRexRM @w (Reg @w 0) m
-        emit8 0x83
-        emitModRMmem grp m
-        emit8 (fromIntegral i)
     | otherwise -> do
         emitRexRM @w (Reg @w 0) m
-        emit8 0x81
+        emit8 (aluImmOpcode (swidth @w) i)
         emitModRMmem grp m
-        emit32 (fromIntegral i)
+        emitAluImmediate (swidth @w) i
   _ -> error "invalid ALU operand combination"
 
 -- Unary: single r/m operand, opcode + /digit
@@ -404,11 +439,11 @@ emitFormUnary :: forall w e s. IsWidth w => Word8 -> Word8 -> Operand w -> CodeG
 emitFormUnary opc digit o = ensureBufferSize maxInsnBytes >> case o of
   RegOp r -> do
     emitRexR @w r
-    emit8 opc
+    emit8 (unaryOpcode (swidth @w) opc)
     emit8 (modRM 3 digit (regCode r))
   MemOp m -> do
     emitRexRM @w (Reg @w 0) m
-    emit8 opc
+    emit8 (unaryOpcode (swidth @w) opc)
     emitModRMmem digit m
   _ -> error "invalid unary operand"
 
@@ -417,16 +452,16 @@ emitFormShift :: forall w e s. IsWidth w => Word8 -> Operand w -> Operand w -> C
 emitFormShift digit dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, ImmOp 1) -> do
     emitRexR @w rd
-    emit8 0xD1
+    emit8 (if isW8 (swidth @w) then 0xD0 else 0xD1)
     emit8 (modRM 3 digit (regCode rd))
   (RegOp rd, ImmOp i) -> do
     emitRexR @w rd
-    emit8 0xC1
+    emit8 (if isW8 (swidth @w) then 0xC0 else 0xC1)
     emit8 (modRM 3 digit (regCode rd))
     emit8 (fromIntegral i)
   (RegOp rd, RegOp (Reg 1)) -> do
     emitRexR @w rd
-    emit8 0xD3
+    emit8 (if isW8 (swidth @w) then 0xD2 else 0xD3)
     emit8 (modRM 3 digit (regCode rd))
   _ -> error "invalid shift operand combination"
 
@@ -511,21 +546,21 @@ test :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
 test dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
-    emit8 0x85
+    emit8 (if isW8 (swidth @w) then 0x84 else 0x85)
     emitModRMrr rs rd
   (RegOp rd, ImmOp i)
     | regCode rd == 0 && Prelude.not (regExt rd) -> do
         emitRexR @w rd
-        emit8 0xA9
-        emit32 (fromIntegral i)
+        emit8 (if isW8 (swidth @w) then 0xA8 else 0xA9)
+        emitImmWidth (swidth @w) i
     | otherwise -> do
         emitRexR @w rd
-        emit8 0xF7
+        emit8 (if isW8 (swidth @w) then 0xF6 else 0xF7)
         emit8 (modRM 3 0 (regCode rd))
-        emit32 (fromIntegral i)
+        emitImmWidth (swidth @w) i
   (MemOp m, RegOp rs) -> do
     emitRexRM @w rs m
-    emit8 0x85
+    emit8 (if isW8 (swidth @w) then 0x84 else 0x85)
     emitModRMmem (regCode rs) m
   _ -> error "invalid TEST operand combination"
 
@@ -534,7 +569,7 @@ mov :: forall w e s. IsWidth w => Operand w -> Operand w -> CodeGen e s ()
 mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
   (RegOp rd, RegOp rs) -> do
     emitRexRR @w rs rd
-    emit8 0x89
+    emit8 (if isW8 (swidth @w) then 0x88 else 0x89)
     emitModRMrr rs rd
   (RegOp rd, ImmOp i) -> case swidth @w of
     SW64
@@ -563,17 +598,17 @@ mov dst src = ensureBufferSize maxInsnBytes >> case (dst, src) of
       emit8 (fromIntegral i)
   (RegOp rd, MemOp m) -> do
     emitRexRM @w rd m
-    emit8 0x8B
+    emit8 (if isW8 (swidth @w) then 0x8A else 0x8B)
     emitModRMmem (regCode rd) m
   (MemOp m, RegOp rs) -> do
     emitRexRM @w rs m
-    emit8 0x89
+    emit8 (if isW8 (swidth @w) then 0x88 else 0x89)
     emitModRMmem (regCode rs) m
   (MemOp m, ImmOp i) -> do
     emitRexRM @w (Reg @w 0) m
-    emit8 0xC7
+    emit8 (if isW8 (swidth @w) then 0xC6 else 0xC7)
     emitModRMmem 0 m
-    emit32 (fromIntegral i)
+    emitImmWidth (swidth @w) i
   _ -> error "invalid MOV operand combination"
 
 lea :: forall w e s. IsWidth w => Reg w -> Mem w -> CodeGen e s ()

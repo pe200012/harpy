@@ -220,7 +220,7 @@ instance Applicative (CodeGen e s) where
     return $ f' x'
 
 instance Monad (CodeGen e s) where
-    return x = cgReturn x
+    return = pure
     m >>= k = cgBind m k
 
 instance MonadFail (CodeGen e s) where
@@ -364,8 +364,8 @@ assembleCodeImage cg uenv ustate =
 -- | Like 'assembleCodeImage', but with explicit configuration.
 assembleCodeImageWithConfig :: CodeGen e s a -> e -> s -> CodeGenConfig -> IO (s, Either ErrMsg (a, CodeImage))
 assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
-    do let initSize = max (codeBufferSize conf) 64
-       buf <- mallocBytes initSize
+    do let initSize = pageAlign (max (codeBufferSize conf) 64)
+       buf <- mmapRW initSize
        let env = CodeGenEnv {tailContext = True}
        let state = emptyCodeGenState{buffer = buf,
                                      firstBuffer = buf,
@@ -374,14 +374,15 @@ assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
                                      config = conf{customCodeBuffer = Nothing}}
        ((ustate', finalState), res) <- cg (uenv, env) (ustate, state)
        case res of
-         Left err -> do free buf; return (ustate', Left err)
+         Left err -> do mmapFree (buffer finalState) (bufferSize finalState)
+                        return (ustate', Left err)
          Right val -> do
            let pending = pendingFixups finalState
            if Prelude.not (Map.null pending)
              then do
                let undefs = Map.keys pending
                    msg = "undefined labels: " ++ show undefs
-               free (buffer finalState)
+               mmapFree (buffer finalState) (bufferSize finalState)
                return (ustate', Left (text msg))
              else do
                let len = bufferOfs finalState
@@ -392,7 +393,7 @@ assembleCodeImageWithConfig (CodeGen cg) uenv ustate conf =
                    img = CodeImage
                            { codeImageSections = [Section TextSection bytes]
                            , codeImageSymbols  = syms }
-               free (buffer finalState)
+               mmapFree (buffer finalState) (bufferSize finalState)
                return (ustate', Right (val, img))
 
 -- | Check whether the code buffer has room for at least the given
@@ -715,7 +716,7 @@ callDecl ns qt =  do
     dynName <- newName "conv"
     let dyn = ForeignD $ ImportF CCall Safe "dynamic" dynName $ ForallT tvars cxt ty
     vs <- mkArgs t
-    cbody <- [| CodeGen (\env (ustate, state) ->
+    cbody <- [| CodeGen (\_env (ustate, state) ->
                         do let code = firstBuffer state
                                sz   = bufferSize state
                                managed = case customCodeBuffer (config state) of

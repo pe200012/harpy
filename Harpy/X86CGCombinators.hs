@@ -75,9 +75,9 @@ emptyUserEnv = UserEnv{bindings = [], dataDest = Ignore,
                        ctrlDest = Return}
 
 ifThenElse :: CodeGen UserEnv s r
-	      -> CodeGen UserEnv s a
-	      -> CodeGen UserEnv s a1
-	      -> CodeGen UserEnv s ()
+           -> CodeGen UserEnv s a
+           -> CodeGen UserEnv s a1
+           -> CodeGen UserEnv s ()
 ifThenElse condCg thenCg elseCg =
     do env <- getEnv
        elseLabel <- newLabel

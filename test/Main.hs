@@ -1,12 +1,15 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -Wno-missing-signatures #-}
 module Main (main) where
 
+import Control.Exception (SomeException, throwIO, try)
+import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
-import Data.Bits ((.&.), (.|.))
 import Data.List (isInfixOf)
 import Data.Word
 import Foreign
 import Foreign.C.Types
+import Numeric (readHex)
 import System.Exit
 import System.IO
 import System.Process
@@ -14,7 +17,6 @@ import Text.Printf
 
 import Harpy hiding (xor, and, or)
 import qualified Harpy (xor, and, or)
-import Harpy.CodeImage
 import Harpy.X86Disassembler
 
 $(callDecl "callAsWord32" [t|Word32 -> IO Word32|])
@@ -111,9 +113,9 @@ nasmAssemble asmText = do
       ExitSuccess   -> Right . BS.unpack <$> BS.readFile outFile
 
 ndisasmDecode :: [Word8] -> IO (Either String String)
-ndisasmDecode bytes = do
+ndisasmDecode rawBytes = do
     let binFile = "/tmp/harpy_test_ndisasm.bin"
-    BS.writeFile binFile (BS.pack bytes)
+    BS.writeFile binFile (BS.pack rawBytes)
     (ec, out, err) <- readProcessWithExitCode "ndisasm" ["-b", "32", binFile] ""
     case ec of
       ExitFailure _ -> return $ Left $ "ndisasm: " ++ err
@@ -207,8 +209,8 @@ testNdisasmRoundTrip _ gen expectedMnemonic = do
     r <- emitBytes gen
     case r of
       Left err -> failWith err
-      Right bytes -> do
-        dr <- ndisasmDecode bytes
+      Right rawBytes -> do
+        dr <- ndisasmDecode rawBytes
         case dr of
           Left err -> failWith err
           Right disasm ->
@@ -306,8 +308,8 @@ testBranchBoundary = do
     r <- emitBytes code
     case r of
       Left err -> failWith err
-      Right bytes ->
-        if length bytes > 0 then pass
+      Right rawBytes ->
+        if length rawBytes > 0 then pass
         else failWith "empty output"
   where
     code = do
@@ -326,10 +328,10 @@ testCodeImageBasic = do
     case res of
       Left err -> failWith $ show err
       Right ((), img) ->
-        let bytes = codeImageBytes img
-        in if BS.length bytes > 0 && BS.last bytes == 0xc3
+        let imageBytes = codeImageBytes img
+        in if BS.length imageBytes > 0 && BS.last imageBytes == 0xc3
           then pass
-          else failWith $ "expected code ending in ret, got " ++ show (BS.unpack bytes)
+          else failWith $ "expected code ending in ret, got " ++ show (BS.unpack imageBytes)
   where
     code :: CodeGen () () ()
     code = mov eax (42 :: Word32) >> ret
@@ -395,6 +397,63 @@ testCodeImageSmallBuffer = do
   where
     code :: CodeGen () () ()
     code = sequence_ (replicate 40 nop) >> mov eax (1 :: Word32) >> ret
+
+testCodeImageBufferGrowth :: IO Result
+testCodeImageBufferGrowth = do
+    let conf = defaultCodeGenConfig { codeBufferSize = 64 }
+    (_, res) <- assembleCodeImageWithConfig code () () conf
+    case res of
+      Left err -> failWith $ show err
+      Right ((), img) ->
+        let sz = codeImageSize img
+        in if sz == 501 then pass
+           else failWith $ "expected 501 bytes from grown buffer, got " ++ show sz
+  where
+    code :: CodeGen () () ()
+    code = replicateM_ 500 nop >> ret
+
+testWithExecutableExceptionCleanup :: IO Result
+testWithExecutableExceptionCleanup = do
+    (_, res) <- assembleCodeImage code () ()
+    case res of
+      Left err -> failWith $ show err
+      Right ((), img) -> do
+        before <- anonymousRxBytes
+        replicateM_ 20 $ do
+          _ <- try (withExecutable img $ \_ ->
+                    throwIO (userError "forced withExecutable cleanup path"))
+               :: IO (Either SomeException ())
+          return ()
+        after <- anonymousRxBytes
+        if after <= before + 4096
+          then pass
+          else failWith $ "anonymous RX mappings grew from "
+                       ++ show before ++ " to " ++ show after
+  where
+    code :: CodeGen () () ()
+    code = ret
+
+anonymousRxBytes :: IO Integer
+anonymousRxBytes = do
+    maps <- readFile "/proc/self/maps"
+    return $ sum [rangeBytes addr | line <- lines maps, Just addr <- [anonymousRxLine line]]
+
+anonymousRxLine :: String -> Maybe String
+anonymousRxLine line =
+    case words line of
+      [addr, perms, _offset, dev, inode]
+        | perms == "r-xp" && dev == "00:00" && inode == "0" -> Just addr
+      _ -> Nothing
+
+rangeBytes :: String -> Integer
+rangeBytes s =
+    case break (== '-') s of
+      (lo, '-':hi) -> hex hi - hex lo
+      _            -> 0
+  where
+    hex x = case readHex x of
+              ((n, _):_) -> n
+              []         -> 0
 
 testCodeImageRoundTrip :: IO Result
 testCodeImageRoundTrip = do
@@ -521,5 +580,7 @@ main = runTests
     , ("codeimage-symbols",      testCodeImageSymbols)
     , ("codeimage-golden",       testCodeImageGolden)
     , ("codeimage-small-buffer", testCodeImageSmallBuffer)
+    , ("codeimage-buffer-growth", testCodeImageBufferGrowth)
+    , ("codeimage-exception-cleanup", testWithExecutableExceptionCleanup)
     , ("codeimage-round-trip",   testCodeImageRoundTrip)
     ]

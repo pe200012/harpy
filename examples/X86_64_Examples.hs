@@ -13,7 +13,7 @@ import Foreign (peekByteOff)
 import Foreign.Ptr
 import Text.Printf
 
-import Harpy.CodeGenMonad (CodeGen, newLabel, defineLabel, assembleCodeImage)
+import Harpy.CodeGenMonad (CodeGen)
 import Harpy.CodeImage
 import Harpy.X86_64
 import Harpy.X86_64.Macro

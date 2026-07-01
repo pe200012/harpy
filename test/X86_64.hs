@@ -7,21 +7,16 @@ import qualified Data.ByteString as BS
 import Data.Word
 import Data.Int
 import Foreign hiding (xor)
-import Foreign.C.Types
 import System.Exit
 import System.IO
 import System.Process
 import Text.Printf
 
-import Harpy.CodeGenMonad
-    ( CodeGen, runCodeGen, defaultCodeGenConfig
-    , assembleCodeImage
-    , newLabel, defineLabel
-    )
+import Harpy.CodeGenMonad (CodeGen)
 import Harpy.CodeImage
 import Harpy.X86_64
 import Harpy.X86_64.Macro
-import Harpy.X86_64.Call (invoke, invokeI64)
+import Harpy.X86_64.Call (invoke, invokeI64, unsafeInvoke)
 
 ------------------------------------------------------------------------
 -- Test harness
@@ -171,11 +166,29 @@ main = runTests
     , ("g-add-rax-1",   testGolden "add rax,1"
         (add (op rax) (imm 1))
         [0x48, 0x83, 0xc0, 0x01])
+    , ("g-add-al-1",    testGolden "add al,1"
+        (add (op al) (imm 1))
+        [0x04, 0x01])
+    , ("g-add-ax-1234", testGolden "add ax,0x1234"
+        (add (op ax) (imm 0x1234))
+        [0x66, 0x05, 0x34, 0x12])
+    , ("g-mov-byte-mem-imm", testGolden "mov byte [rax],1"
+        (mov (mem (base rax) :: Operand 'W8) (imm 1))
+        [0xc6, 0x00, 0x01])
+    , ("g-mov-word-mem-imm", testGolden "mov word [rax],0x1234"
+        (mov (mem (base rax) :: Operand 'W16) (imm 0x1234))
+        [0x66, 0xc7, 0x00, 0x34, 0x12])
+    , ("g-shl-al-1",   testGolden "shl al,1"
+        (shl (op al) (imm 1))
+        [0xd0, 0xe0])
 
     -- INC/DEC (FF /0 /1 form)
     , ("g-inc-rax",     testGolden "inc rax"
         (inc (op rax))
         [0x48, 0xff, 0xc0])
+    , ("g-inc-al",      testGolden "inc al"
+        (inc (op al))
+        [0xfe, 0xc0])
     , ("g-dec-r13",     testGolden "dec r13"
         (dec (op r13))
         [0x49, 0xff, 0xcd])
@@ -318,6 +331,10 @@ main = runTests
         if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
     , ("x-invokeI64",   do
         r <- invokeI64 (mov (op rax) (op rdi) >> add (op rax) (imm 1) >> ret) 41
+        if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
+    , ("x-unsafeInvoke", do
+        r <- unsafeInvoke (mov (op rax) (imm 42) >> ret) $ \fp ->
+          mkCallIO (castFunPtr fp)
         if r == 42 then pass else failWith $ "expected 42, got " ++ show r)
 
     -- Verification tests

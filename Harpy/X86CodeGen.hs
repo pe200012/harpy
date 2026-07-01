@@ -430,7 +430,7 @@ negateCC cc =
 -- | Used to encode the fact that no base register is used in an
 -- instruction.
 x86_nobasereg :: Word8
-x86_nobasereg = (-1)
+x86_nobasereg = 0xff
 
 x86_edi_mask, x86_esi_mask, x86_ebx_mask, x86_ebp_mask,
     x86_eax_mask, x86_ecx_mask, x86_edx_mask:: Int
@@ -2181,4 +2181,3 @@ x86_prefetch_regp hint reg =
     do emit8 0x0f
        emit8 0x18
        x86_regp_emit hint reg
-

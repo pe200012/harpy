@@ -52,15 +52,16 @@ invokeI64_I64_I64 code a b c = do
     Right ((), img) -> withExecutable img $ \exe ->
       mkI64I64I64I64 (castPtrToFunPtr (executableEntryPtr exe)) a b c
 
--- | Assemble and invoke via an arbitrary FunPtr cast. The caller is
--- responsible for providing a matching dynamic wrapper.
-unsafeInvoke :: CodeGen () () () -> (FunPtr a -> b) -> IO b
+-- | Assemble and invoke via an arbitrary FunPtr action. The caller is
+-- responsible for providing a matching dynamic wrapper and running it
+-- within the supplied action.
+unsafeInvoke :: CodeGen () () () -> (FunPtr a -> IO b) -> IO b
 unsafeInvoke code mk = do
   (_, res) <- assembleCodeImage code () ()
   case res of
     Left err -> error ("unsafeInvoke: " ++ show err)
     Right ((), img) -> withExecutable img $ \exe ->
-      return $ mk (castPtrToFunPtr (executableEntryPtr exe))
+      mk (castPtrToFunPtr (executableEntryPtr exe))
 
 foreign import ccall "dynamic"
   mkVoidW64 :: FunPtr (IO Word64) -> IO Word64

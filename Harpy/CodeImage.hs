@@ -41,6 +41,7 @@ import Harpy.CodeGenMonad
     , assembleCodeImage, assembleCodeImageWithConfig
     )
 
+import Control.Exception (bracket)
 import qualified Data.ByteString as BS
 import Data.Bits
 import Data.Word
@@ -105,11 +106,7 @@ loadCodeImage img = do
 
 -- | Load a 'CodeImage', run an action with the executable, then free it.
 withExecutable :: CodeImage -> (Executable -> IO a) -> IO a
-withExecutable img act = do
-    exe <- loadCodeImage img
-    r <- act exe
-    freeExecutable exe
-    return r
+withExecutable img = bracket (loadCodeImage img) freeExecutable
 
 -- | Free the executable memory.
 freeExecutable :: Executable -> IO ()
